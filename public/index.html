@@ -28,6 +28,12 @@
   textarea,input,select { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:7px; width:100%; background:#fff; }
   pre { background:#0f1115; color:#e6e6e6; padding:12px; border-radius:8px; overflow:auto; font-size:12.5px; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  /* ---- 知识点图谱（分层 DAG）---- */
+  .netwrap { overflow:auto; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin:10px 0 0; }
+  .legend i { display:inline-block; width:11px; height:11px; border-radius:3px; margin-right:5px; vertical-align:-1px; border:1px solid rgba(0,0,0,.14); }
+  svg .node, svg .edge { transition:opacity .12s ease; }
+  #netDetail { margin-top:10px; font-size:13px; }
 </style>
 </head>
 <body>
@@ -48,7 +54,24 @@
   <div id="warnBox"></div>
 
   <div class="card">
-    <h2>知识点网络（前置边 + 掌握度 + 考频）</h2>
+    <h2>知识点图谱 · 分层（前置关系一眼可见）</h2>
+    <p class="sub">
+      <b>横向分层</b>＝拓扑序（最左＝基础，向右＝综合）；箭头由「前置」指向「后继」；
+      节点颜色＝掌握度，左侧色条粗细＝考频。<b>悬停</b>高亮整条链路，<b>点击</b>看该点的资料 / 真题 / 题型。
+    </p>
+    <div id="netStats" class="sub" style="margin-bottom:8px">加载中…</div>
+    <div class="netwrap"><div id="net">加载中…</div></div>
+    <div class="legend">
+      <span><i style="background:#eef1f5;border-color:#b9c3ce"></i>未学过（先验 0.5）</span>
+      <span><i style="background:#fdecea;border-color:#dfa39d"></i>薄弱 &lt; 0.5</span>
+      <span><i style="background:#eaf1fd;border-color:#9dbce8"></i>进行中 0.5–0.8</span>
+      <span><i style="background:#e9f6ee;border-color:#84bd98"></i>已掌握 ≥ 0.8</span>
+    </div>
+    <div id="netDetail"></div>
+  </div>
+
+  <div class="card">
+    <h2>知识点明细表（数据视角）</h2>
     <p class="sub">掌握度为空 = 还没学过（冷启动先验 0.5）。考频 = 该知识点被历年真题提及的次数。</p>
     <div id="graph">加载中…</div>
   </div>
@@ -99,6 +122,176 @@ function bar(v) {
   return `<span class="bar"><i style="width:${pct}%"></i></span> <span class="sub">${v === null || v === undefined ? "—" : v.toFixed(2)}</span>`;
 }
 
+/* ============ 知识点图谱：分层 DAG，原生 SVG，零依赖 ============
+   布局依据 = 拓扑分层（与 makePlan 的排序同源，确定性、可复现，不用力导向）
+   x = 层号，y = 层内序号；层内顺序 = 计划排序键（已掌握排最后 / 掌握度 / 考频 / 名字） */
+const NET = { colW: 186, rowH: 36, nodeW: 132, nodeH: 26, padX: 26, headH: 30, padB: 16 };
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function clip(s, n) { return s.length > n ? s.slice(0, n) + "…" : s; }
+function mastStyle(m) {
+  if (m === null || m === undefined) return { fill: "#eef1f5", stroke: "#b9c3ce", ink: "#55606c" };
+  if (m >= 0.8) return { fill: "#e9f6ee", stroke: "#84bd98", ink: "#2b6a43" };
+  if (m >= 0.5) return { fill: "#eaf1fd", stroke: "#9dbce8", ink: "#2b4d80" };
+  return { fill: "#fdecea", stroke: "#dfa39d", ink: "#8a3b34" };
+}
+
+function renderNet(d) {
+  const pts = d.points;
+  const byName = new Map(pts.map((p) => [p.name, p]));
+  const nextOf = new Map(pts.map((p) => [p.name, []]));
+  const prevOf = new Map(pts.map((p) => [p.name, []]));
+  for (const p of pts) {
+    for (const q of p.prev) {
+      if (!byName.has(q) || q === p.name) continue;
+      prevOf.get(p.name).push(q);
+      nextOf.get(q).push(p.name);
+    }
+  }
+
+  // 孤立点：既无前置也无后继（模型抽出但没和任何点连起来）→ 单独一块，如实展示
+  const iso = pts.filter((p) => prevOf.get(p.name).length === 0 && nextOf.get(p.name).length === 0).map((p) => p.name);
+  const isoSet = new Set(iso);
+  const conn = pts.map((p) => p.name).filter((n) => !isoSet.has(n));
+
+  // 最长路径分层（Kahn）；环内残留点兜到底层 +1（环已被引擎打破，这里只是兜底）
+  const layer = new Map(conn.map((n) => [n, 0]));
+  const deg = new Map(conn.map((n) => [n, prevOf.get(n).filter((x) => !isoSet.has(x)).length]));
+  const q = conn.filter((n) => deg.get(n) === 0);
+  for (let h = 0; h < q.length; h++) {
+    const u = q[h];
+    for (const v of nextOf.get(u)) {
+      if (isoSet.has(v)) continue;
+      if (layer.get(v) < layer.get(u) + 1) layer.set(v, layer.get(u) + 1);
+      deg.set(v, deg.get(v) - 1);
+      if (deg.get(v) === 0) q.push(v);
+    }
+  }
+  let maxL = 0;
+  for (const n of conn) maxL = Math.max(maxL, layer.get(n));
+  for (const n of conn) if (deg.get(n) > 0) layer.set(n, maxL + 1);
+
+  const keyOf = (n) => {
+    const p = byName.get(n);
+    const m = p.mastery === null || p.mastery === undefined ? 0.5 : p.mastery;
+    return [m >= 0.8 ? 1 : 0, m, -p.mention, n];
+  };
+  const byLayer = new Map();
+  for (const n of conn) {
+    const L = layer.get(n);
+    if (!byLayer.has(L)) byLayer.set(L, []);
+    byLayer.get(L).push(n);
+  }
+  const cmp = (a, b) => {
+    const ka = keyOf(a), kb = keyOf(b);
+    for (let i = 0; i < 3; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+    return ka[3] < kb[3] ? -1 : ka[3] > kb[3] ? 1 : 0;
+  };
+  for (const arr of byLayer.values()) arr.sort(cmp);
+  iso.sort(cmp);
+
+  const layerKeys = [...byLayer.keys()].sort((a, b) => a - b);
+  const pos = new Map();
+  layerKeys.forEach((L, li) =>
+    byLayer.get(L).forEach((n, i) => pos.set(n, { x: NET.padX + li * NET.colW, y: NET.headH + i * NET.rowH }))
+  );
+  const isoX = NET.padX + layerKeys.length * NET.colW;
+  iso.forEach((n, i) => pos.set(n, { x: isoX, y: NET.headH + i * NET.rowH }));
+
+  const rows = Math.max(1, ...layerKeys.map((L) => byLayer.get(L).length), iso.length);
+  const W = (iso.length ? isoX : NET.padX + Math.max(0, layerKeys.length - 1) * NET.colW) + NET.nodeW + NET.padX;
+  const H = NET.headH + rows * NET.rowH + NET.padB;
+  const cy = (n) => pos.get(n).y + NET.nodeH / 2;
+
+  const out = [];
+  out.push(`<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system,'Segoe UI','Microsoft YaHei',sans-serif">`);
+  out.push(`<defs><marker id="netArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b7c2cf"/></marker></defs>`);
+
+  // 分层底色 + 层号
+  layerKeys.forEach((L, li) => {
+    const x = NET.padX + li * NET.colW - 10;
+    out.push(`<rect x="${x}" y="6" width="${NET.nodeW + 20}" height="${H - 14}" rx="10" fill="#fafbfc" stroke="#eef1f4"/>`);
+    out.push(`<text x="${x + (NET.nodeW + 20) / 2}" y="22" text-anchor="middle" font-size="11" fill="#98a1ab">第 ${L} 层</text>`);
+  });
+  if (iso.length) {
+    out.push(`<rect x="${isoX - 10}" y="6" width="${NET.nodeW + 20}" height="${H - 14}" rx="10" fill="#fbfaf7" stroke="#f0ece2"/>`);
+    out.push(`<text x="${isoX - 10 + (NET.nodeW + 20) / 2}" y="22" text-anchor="middle" font-size="11" fill="#b0a48c">未关联知识点</text>`);
+  }
+
+  // 边（前置 → 后继）
+  for (const p of pts) {
+    for (const u of prevOf.get(p.name)) {
+      const v = p.name;
+      const x1 = pos.get(u).x + NET.nodeW, y1 = cy(u);
+      const x2 = pos.get(v).x, y2 = cy(v);
+      const dx = Math.max(16, (x2 - x1) / 2);
+      out.push(
+        `<path class="edge" data-a="${esc(u)}" data-b="${esc(v)}" d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" fill="none" stroke="#c8d1dc" stroke-width="1.4" marker-end="url(#netArrow)"/>`
+      );
+    }
+  }
+
+  // 节点
+  for (const p of pts) {
+    const q2 = pos.get(p.name);
+    const st = mastStyle(p.mastery);
+    const barW = 2 + Math.min(6, p.mention * 1.2);
+    const mTxt = p.mastery === null || p.mastery === undefined ? "未学过（先验 0.5）" : p.mastery.toFixed(2);
+    out.push(
+      `<g class="node" data-n="${esc(p.name)}" style="cursor:pointer">` +
+        `<title>${esc(p.name)}\n掌握度：${mTxt}\n考频：${p.mention} 次\n前置：${p.prev.length ? esc(p.prev.join("、")) : "无"}</title>` +
+        `<rect x="${q2.x}" y="${q2.y}" width="${NET.nodeW}" height="${NET.nodeH}" rx="7" fill="${st.fill}" stroke="${st.stroke}" stroke-width="1.3"/>` +
+        `<rect x="${q2.x + 3}" y="${q2.y + 4}" width="${barW}" height="${NET.nodeH - 8}" rx="2" fill="${st.stroke}" opacity="0.65"/>` +
+        `<text x="${q2.x + NET.nodeW / 2 + 3}" y="${q2.y + NET.nodeH / 2 + 4}" text-anchor="middle" font-size="12" fill="${st.ink}">${esc(clip(p.name, 9))}</text>` +
+        `</g>`
+    );
+  }
+  out.push(`</svg>`);
+
+  $("#net").innerHTML = out.join("");
+  $("#netStats").innerHTML =
+    `知识点 <b>${pts.length}</b> 个：已连接 <b>${conn.length}</b> 个（<b>${layerKeys.length}</b> 层）` +
+    `＋ 未关联 <b>${iso.length}</b> 个 ｜ 前置边 <b>${d.points.reduce((s, p) => s + prevOf.get(p.name).length, 0)}</b> 条`;
+
+  // 悬停高亮整条链路（祖先 ∪ 自身 ∪ 后代）
+  const relSet = (n) => {
+    const s = new Set([n]);
+    const up = [n];
+    while (up.length) { const u = up.pop(); for (const x of prevOf.get(u)) if (!s.has(x)) { s.add(x); up.push(x); } }
+    const dn = [n];
+    while (dn.length) { const u = dn.pop(); for (const x of nextOf.get(u)) if (!s.has(x)) { s.add(x); dn.push(x); } }
+    return s;
+  };
+  const nodes = [...$("#net").querySelectorAll(".node")];
+  const edges = [...$("#net").querySelectorAll(".edge")];
+  const reset = () => { nodes.forEach((e) => (e.style.opacity = "1")); edges.forEach((e) => (e.style.opacity = "1")); };
+  for (const el of nodes) {
+    const n = el.getAttribute("data-n");
+    el.addEventListener("mouseenter", () => {
+      const keep = relSet(n);
+      nodes.forEach((e) => (e.style.opacity = keep.has(e.getAttribute("data-n")) ? "1" : "0.16"));
+      edges.forEach((e) => (e.style.opacity = keep.has(e.getAttribute("data-a")) && keep.has(e.getAttribute("data-b")) ? "1" : "0.1"));
+    });
+    el.addEventListener("mouseleave", reset);
+    el.addEventListener("click", () => showPoint(n));
+  }
+}
+
+async function showPoint(name) {
+  const d = await api("/api/point?name=" + encodeURIComponent(name));
+  const tags = (a) => (a && a.length ? a.map((x) => `<span class="tag">${esc(x)}</span>`).join("") : '<span class="sub">无</span>');
+  $("#netDetail").innerHTML =
+    `<div style="border-top:1px solid var(--line);padding-top:10px">` +
+    `<b>${esc(d.name)}</b>` +
+    `<div class="sub" style="margin:4px 0 8px">掌握度：${d.mastery === null || d.mastery === undefined ? "未学过（先验 0.5）" : d.mastery.toFixed(2)}</div>` +
+    `<div><b class="sub">资料</b> ${tags((d.resources || []).map((r) => r.split("/").pop()))}</div>` +
+    `<div style="margin-top:6px"><b class="sub">真题</b> ${tags((d.problems || []).map((p) => p.name + " · " + p.kind))}</div>` +
+    `<div style="margin-top:6px"><b class="sub">题型</b> ${tags(d.kinds)}</div>` +
+    `</div>`;
+}
+
 async function loadGraph() {
   const d = await api("/api/graph");
   $("#summary").innerHTML =
@@ -119,6 +312,9 @@ async function loadGraph() {
       <td>${p.prev.map((x) => `<span class="tag">← ${x}</span>`).join("") || '<span class="sub">无前置</span>'}</td>
     </tr>`).join("");
   $("#graph").innerHTML = `<table><thead><tr><th>知识点</th><th>掌握度</th><th>考频</th><th>资料</th><th>前置</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  renderNet(d);
+  $("#netDetail").innerHTML = "";
 
   $("#rank").innerHTML = d.points.sort((a, b) => b.mention - a.mention).slice(0, 10)
     .map((p, i) => `${i + 1}. ${p.name} <span class="sub">· ${p.mention} 次</span>`).join("<br>");
