@@ -53,7 +53,17 @@ import {
 export type ActionFiller = (point: Point) => LearnAction[];
 
 export interface SimNetOptions {
+  /** **可写产物**目录：graph / state / answers / history / decisions 落在这里。 */
   dataDir?: string;
+  /**
+   * **只读输入**目录：aliases.json、presets/analyze-req.json 在这里。
+   * 默认 = dataDir（单目录部署时二者相同）。
+   *
+   * 【2026-10-11 修 bug】以前 analyzeRes 把 dataDir 当预设目录用 —— 而网页壳的 dataDir
+   * 是 `data/.runtime`，于是它去读 `data/.runtime/presets/analyze-req.json`（永远不存在），
+   * **presets 兜底在网页壳里实际不可达**。输入与产物是两个目录，必须分开传。
+   */
+  inputDir?: string;
   aliases?: AliasTable;
   skipLoad?: boolean; // 测试用：跳过已持久化的 graph/state，从空体系开始
 }
@@ -74,13 +84,16 @@ export class SimNet implements SimulationNetwork {
   decisions: DecisionEntry[] = [];
   private aliases: AliasTable;
   private dataDir: string;
+  /** 只读输入目录（预设 / 别名表）。见 SimNetOptions.inputDir 的注释。 */
+  private inputDir: string;
   private nameToPid = new Map<string, number>(); // canonical name → pid
   private warnings: string[] = [];
   actionFiller: ActionFiller | null = null;
 
   constructor(opts: SimNetOptions = {}) {
     this.dataDir = opts.dataDir ?? "data";
-    this.aliases = opts.aliases ?? loadAliases(path.join(this.dataDir, "aliases.json"));
+    this.inputDir = opts.inputDir ?? this.dataDir;
+    this.aliases = opts.aliases ?? loadAliases(path.join(this.inputDir, "aliases.json"));
     if (!opts.skipLoad) {
       const ps = loadState(path.join(this.dataDir, "state.json"));
       this.state = ps.state;
@@ -496,7 +509,8 @@ export class SimNet implements SimulationNetwork {
 
   // ---------- §4.9 analyzeRes / analyzePro（委托 analyze.ts 流水线） ----------
   async analyzeRes(resource: Resource): Promise<AnalyzeResReq> {
-    return analyzeResource(resource, { dataDir: this.dataDir });
+    // 🔴 传 inputDir（只读输入），**不是** dataDir（可写产物）：presets 在输入侧。
+    return analyzeResource(resource, { dataDir: this.inputDir });
   }
 
   async analyzePro(problem: Problem): Promise<AnalyzeProReq> {
