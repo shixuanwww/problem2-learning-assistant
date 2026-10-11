@@ -63,7 +63,7 @@ export function fillActions(net: SimNet, point: { name: string; pid?: number }):
 
   // 规则 2 + 3：选一道"主"真题（优先考频高，排除回炉题），再把"回炉"真题作为额外加量
   const reviewNames = new Set(net.reviewProblemNames({ name: point.name }));
-  const primary = pickProblem(net, { name: point.name, pid }, key, reviewNames);
+  const primary = pickProblem(net, { name: point.name, pid }, reviewNames);
   if (primary) {
     actions.push({ kind: "Do", problem: primary });
   }
@@ -84,7 +84,6 @@ export function fillActions(net: SimNet, point: { name: string; pid?: number }):
 function pickProblem(
   net: SimNet,
   point: { name: string; pid?: number },
-  key: string,
   exclude: Set<string> = new Set(),
 ): Problem | undefined {
   // 选"主"真题：覆盖本点、且其 points 中 max(pointMention) 最高（考频最高）的题；
@@ -111,12 +110,19 @@ function pickProblem(
 /**
  * 模型只允许返回"知识点名 + 动作意图"的 JSON 草稿；本函数校验并拒掉不合法提议。
  * 任一校验不过 ⇒ accepted=false、rejected 列出每条理由、不执行，交由调用方回落规则版计划。
+ *
+ * 【2026-10-11 补齐 §4.13】三条此前缺失的：
+ *   ① 校验 6「每个知识点**恰好一次**」—— 早期只查了"不重复"，没查"不遗漏"，
+ *      于是"只提议 1 个点、剩下全漏掉"也会被 accepted，与规则版计划的完整性口径不一致；
+ *   ② **决策日志** —— 接受 / 拒绝都记一条（含**原始草稿**）到 data/decisions.json，可回放；
+ *   ③ **回落可见** —— 拒绝时不执行、把决定权交回调用方（§4.7 规则版计划），
+ *      demo 里会打印"拒绝理由 → 回落后的计划"整条链路。
  */
 export function proposePlan(net: SimNet, draft: unknown): PlanProposalResult {
   // 1) schema 校验（字段 / 类型 / 枚举）
   const schemaErrs = validateDraftSchema(draft);
   if (schemaErrs.length > 0) {
-    return { accepted: false, rejected: schemaErrs };
+    return rejectProposal(net, draft, schemaErrs);
   }
 
   const entries = draft as Array<{
@@ -166,17 +172,33 @@ export function proposePlan(net: SimNet, draft: unknown): PlanProposalResult {
     plan.push({ point, actions });
   }
 
+  // 6) 覆盖完整性：每个存活知识点恰好一次（§4.13 校验 6）
+  const missing = net.alivePoints().filter((p) => !seen.has(net.keyOf(p.name)));
+  if (missing.length > 0) {
+    rejected.push(
+      `计划遗漏了 ${missing.length} 个知识点（§4.13 要求每个知识点恰好一次）：` +
+        missing.map((p) => p.name).join("、"),
+    );
+  }
+
   if (rejected.length > 0) {
-    return { accepted: false, rejected };
+    return rejectProposal(net, draft, rejected);
   }
 
   // 5) 拓扑序校验：from 必须在 to 之前（§4.2 硬要求）
   const topoErrs = validateTopoOrder(net, plan);
   if (topoErrs.length > 0) {
-    return { accepted: false, rejected: topoErrs };
+    return rejectProposal(net, draft, topoErrs);
   }
 
+  net.logDecision({ at: new Date().toISOString(), action: "proposePlan.accept", reasons: [], draft });
   return { accepted: true, plan };
+}
+
+/** 统一的拒绝出口：记决策日志（理由 + 原始草稿），不执行、由调用方回落规则版计划。 */
+function rejectProposal(net: SimNet, draft: unknown, reasons: string[]): PlanProposalResult {
+  net.logDecision({ at: new Date().toISOString(), action: "proposePlan.reject", reasons, draft });
+  return { accepted: false, rejected: reasons };
 }
 
 /** 草稿 schema：必须是数组；每项 { pointName: string, actions: [...] }；每个动作 kind ∈ 枚举。 */
@@ -228,7 +250,6 @@ function validateTopoOrder(net: SimNet, plan: LearnPlan): string[] {
     pos.set(net.keyOf(it.point.name), idx);
   });
   for (let i = 0; i < plan.length; i++) {
-    const key = net.keyOf(plan[i].point.name);
     const pid = plan[i].point.pid;
     if (pid === undefined) continue;
     for (const prv of net.graph[pid].prev) {

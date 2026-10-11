@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "node:path";
 import {
   type AnswerRecord,
+  type DecisionEntry,
   type HistoryEntry,
   type KindState,
   type State,
@@ -75,4 +76,27 @@ export function loadHistory(file: string): HistoryEntry[] {
 }
 export function saveHistory(file: string, history: HistoryEntry[]): void {
   atomicWrite(file, history);
+}
+
+// ---------- decisions.json：DecisionEntry[]（§4.13 决策日志） ----------
+export function loadDecisions(file: string): DecisionEntry[] {
+  const raw = readJSON(file);
+  if (raw && Array.isArray(raw)) return raw as DecisionEntry[];
+  return [];
+}
+export function saveDecisions(file: string, decisions: DecisionEntry[]): void {
+  atomicWrite(file, decisions);
+}
+
+// ---------- 保留策略（§11：只留最近 500 条，超出按 at 裁剪） ----------
+/**
+ * 按 `at`（ISO 时间戳，字典序即时间序）升序排序后只保留最近 keep 条。
+ * 追加顺序即写入顺序，正常情况下已经是升序 —— 但载入的历史文件可能被外部打乱，
+ * 所以这里显式排序，保证"最近 N 条"的语义稳定、可复现。
+ */
+export function keepRecent<T extends { at: string }>(items: T[], keep: number): T[] {
+  if (items.length <= keep) return items;
+  return [...items]
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
+    .slice(items.length - keep);
 }

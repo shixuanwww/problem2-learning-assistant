@@ -10,13 +10,11 @@
 // ============================================================================
 import path from "node:path";
 import {
-  type AIAssistant,
   type AnalyzeProReq,
   type AnalyzeReq,
   type AnalyzeResReq,
   type AnswerRecord,
-  type Citation,
-  type Edge,
+  type DecisionEntry,
   type HistoryEntry,
   type KindState,
   type LearnAction,
@@ -28,6 +26,7 @@ import {
   type Resource,
   type SimulationNetwork,
   type State,
+  KEEP_RECENT,
   MASTERY_DELTA,
   MASTERY_THRESHOLD,
   UNCLASSIFIED_KIND,
@@ -38,11 +37,14 @@ import { canonicalize, loadAliases, type AliasTable } from "./normalize.ts";
 import { analyzeProblem, analyzeResource } from "./analyze/analyze.ts";
 import {
   atomicWrite,
+  keepRecent,
   loadAnswers,
+  loadDecisions,
   loadHistory,
   loadState,
   readJSON,
   saveAnswers,
+  saveDecisions,
   saveHistory,
   saveState,
 } from "./store.ts";
@@ -68,11 +70,12 @@ export class SimNet implements SimulationNetwork {
 
   // —— 内部 / 扩展 ——
   answers: AnswerRecord[] = [];
+  /** §4.13 决策日志：模型提议的接受 / 拒绝留痕（含原始草稿），落盘 data/decisions.json */
+  decisions: DecisionEntry[] = [];
   private aliases: AliasTable;
   private dataDir: string;
   private nameToPid = new Map<string, number>(); // canonical name → pid
   private warnings: string[] = [];
-  private lastCycleNodes: number[] = [];
   actionFiller: ActionFiller | null = null;
 
   constructor(opts: SimNetOptions = {}) {
@@ -84,6 +87,7 @@ export class SimNet implements SimulationNetwork {
       this.kindState = ps.kindState;
       this.answers = loadAnswers(path.join(this.dataDir, "answers.json"));
       this.history = loadHistory(path.join(this.dataDir, "history.json"));
+      this.decisions = loadDecisions(path.join(this.dataDir, "decisions.json"));
       this.loadGraph(path.join(this.dataDir, "graph.json"));
     }
   }
@@ -119,6 +123,18 @@ export class SimNet implements SimulationNetwork {
     return pids;
   }
 
+  /** 存活知识点的 Point 列表（供 §4.13 的"恰好一次"校验 / 对外展示）。 */
+  alivePoints(): Point[] {
+    return this.alivePids().map((pid) => this.pointByPid(pid));
+  }
+
+  /** §4.13 决策日志：记一条（proposePlan 接受/拒绝都走它），并落盘 data/decisions.json。 */
+  logDecision(entry: DecisionEntry): void {
+    this.decisions.push(entry);
+    this.decisions = keepRecent(this.decisions, KEEP_RECENT);
+    saveDecisions(path.join(this.dataDir, "decisions.json"), this.decisions);
+  }
+
   /**
    * 确保知识点在图中，返回 pid。已存在（归一化后同 key）则复用，不新建（幂等）。
    * 撞车提示：若一个新点的名字与既有某个点仅在括号编号上不同，记一条 warning（不合并）。
@@ -133,12 +149,12 @@ export class SimNet implements SimulationNetwork {
     this.pointMention.push(0);
     this.nameToPid.set(key, pid);
 
-    if (warnVariant) this.warnIfVariableVariant(rawName, key);
+    if (warnVariant) this.warnIfVariableVariant(rawName);
     return pid;
   }
 
   /** 启发式：若新点名字去掉括号编号后，与某个既有点相同，提示可用别名（§4.5 / 用例 19）。 */
-  private warnIfVariableVariant(rawName: string, key: string): void {
+  private warnIfVariableVariant(rawName: string): void {
     const stripped = stripParens(rawName);
     if (!stripped) return;
     for (let i = 0; i < this.graph.length; i++) {
@@ -250,10 +266,9 @@ export class SimNet implements SimulationNetwork {
       frontier = alive.filter((pid) => !used.has(pid) && (indeg.get(pid) ?? 0) === 0);
     }
 
-    // 环：剩余未处理 → 打破环补齐输出（保证每个点恰好一次），并记录供 cycles()
+    // 环：剩余未处理 → 打破环补齐输出（保证每个点恰好一次），并告警
     const remaining = alive.filter((pid) => !used.has(pid));
     if (remaining.length > 0) {
-      this.lastCycleNodes = remaining;
       remaining.sort((a, b) => this.compareByPlanKey(a, b));
       for (const pid of remaining) {
         used.add(pid);
@@ -261,7 +276,7 @@ export class SimNet implements SimulationNetwork {
       }
       this.warn(
         `知识点之间存在环（${remaining.length} 个点未能在拓扑前排出），已打破环并补齐输出；` +
-          `详见 cycles()。`,
+          `环的构成见 cycles()。`,
       );
     }
     return ordered;
@@ -272,42 +287,60 @@ export class SimNet implements SimulationNetwork {
     return this.topoPids().map((pid) => this.pointByPid(pid));
   }
 
-  /** 环检测：返回若干环路（每个是一组 Point）。仅用于 README / 日志说明。 */
+  /**
+   * 环检测：返回若干环路（每个是一组 Point）。仅用于 README / 日志说明。
+   * 【2026-10-11 修正】早期实现依赖 `lastCycleNodes`（由 topoPids() 写入）⇒ 必须先调
+   * `topoOrder()` / `makePlan()` 再调本方法，否则恒返回 []，是隐蔽的顺序耦合。
+   * 现在独立计算：在"存活点子图"上做迭代式 DFS（白/灰/黑染色），遇到灰点即回边 ⇒ 提环。
+   * 与调用顺序无关，可随时单独调用。
+   */
   cycles(): Point[][] {
-    const cycleSet = new Set(this.lastCycleNodes);
-    if (cycleSet.size === 0) return [];
+    const alive = this.alivePids();
+    const aliveSet = new Set(alive);
     const result: Point[][] = [];
-    const color = new Map<number, number>(); // 0 白 / 1 灰 / 2 黑
-    const stack: number[] = [];
+    const color = new Map<number, number>(); // 0 未见 / 1 在栈上 / 2 已完成
+    const seenCycle = new Set<string>(); // 规范化后的环签名，避免同一个环被重复收录
 
-    // 在环子图上做 DFS 找一条环
-    for (const start of this.lastCycleNodes) {
+    // 后继表（v → 以 v 为前驱的所有点），只在存活子图上建
+    const succ = new Map<number, number[]>();
+    for (const pid of alive) {
+      for (const q of this.graph[pid].prev) {
+        if (q.pid === undefined || !aliveSet.has(q.pid)) continue;
+        if (!succ.has(q.pid)) succ.set(q.pid, []);
+        succ.get(q.pid)!.push(pid);
+      }
+    }
+
+    for (const start of alive) {
       if (color.get(start)) continue;
-      // 迭代式 DFS（避免深递归）
-      const dfsStack: Array<{ pid: number; idx: number }> = [{ pid: start, idx: 0 }];
+      const stack: number[] = [start];
+      const frames: Array<{ pid: number; idx: number }> = [{ pid: start, idx: 0 }];
       color.set(start, 1);
-      stack.push(start);
-      while (dfsStack.length > 0) {
-        const cur = dfsStack[dfsStack.length - 1];
-        const nbrs = this.graph[cur.pid].prev
-          .map((q) => q.pid)
-          .filter((n): n is number => n !== undefined && cycleSet.has(n) && n !== cur.pid);
+      while (frames.length > 0) {
+        const cur = frames[frames.length - 1];
+        const nbrs = succ.get(cur.pid) ?? [];
         if (cur.idx < nbrs.length) {
           const nxt = nbrs[cur.idx++];
           if (!color.get(nxt)) {
             color.set(nxt, 1);
             stack.push(nxt);
-            dfsStack.push({ pid: nxt, idx: 0 });
+            frames.push({ pid: nxt, idx: 0 });
           } else if (color.get(nxt) === 1) {
-            // 灰 → 回边，提取环
+            // 灰点 ⇒ 回边，从栈里截出 [nxt … cur] 这一段
             const i = stack.indexOf(nxt);
-            if (i >= 0) result.push([...stack.slice(i), nxt].map((p) => this.pointByPid(p)));
-            color.set(nxt, 2);
+            if (i >= 0) {
+              const ring = stack.slice(i);
+              const sig = [...ring].sort((a, b) => a - b).join(",");
+              if (!seenCycle.has(sig)) {
+                seenCycle.add(sig);
+                result.push([...ring, nxt].map((p) => this.pointByPid(p)));
+              }
+            }
           }
         } else {
           color.set(cur.pid, 2);
           stack.pop();
-          dfsStack.pop();
+          frames.pop();
         }
       }
     }
@@ -445,13 +478,19 @@ export class SimNet implements SimulationNetwork {
     fromNode.dead = true;
     this.nameToPid.delete(fromKey);
 
+    // 【2026-10-11 修正】早期用 kind:"Ask" 记这条，会污染 §8 用例 16 的 Ask 计数。
+    // 合并知识点会改写掌握度（属"决策"而非"学习行为"）⇒ 用专用 kind "Merge"。
     this.history.push({
       at: new Date().toISOString(),
-      kind: "Ask", // 用 Ask 做记录不合适；改用一个通用 detail（kind 仍需枚举值）
+      kind: "Merge",
       detail: `合并知识点「${fromNode.name}」→「${intoNode.name}」`,
       pointNames: [intoKey],
+      before: fromVal,
+      after: this.state.get(intoKey),
     });
+    this.history = keepRecent(this.history, KEEP_RECENT);
 
+    this.persistState(); // state / answers / history / decisions 一起落盘
     this.persistGraph();
   }
 
@@ -470,13 +509,20 @@ export class SimNet implements SimulationNetwork {
     if (learn.kind === "Do") {
       const { problem, status } = learn;
       const delta = MASTERY_DELTA[status];
-      const pointKeys: string[] = [];
-      const firstKeyText: string[] = [];
+      const pointKeys = problem.points.map((p) => this.lookupKey(p.name));
+
+      // 一致性检查：题目提到的知识点若不在图中（既无资料也未被任何真题引入过），
+      // 说明这条 record 来自体系之外。仍然记状态（学习确实发生了），但明确告警，
+      // 不静默留下"图中查不到的 state key"。
       for (const p of problem.points) {
-        const key = this.lookupKey(p.name);
-        pointKeys.push(key);
-        firstKeyText.push(p.name);
+        if (this.findPid(p.name) < 0) {
+          this.warn(
+            `record(Do) 的题目「${problem.name}」提到知识点「${p.name}」，但它不在当前知识体系中` +
+              `（无资料/真题引入过）。已照常记录掌握度，但该点不会出现在 makePlan 里。`,
+          );
+        }
       }
+
       // 知识点掌握度（用 masteryOf 读旧值，冷启动 0.5）
       let before = 0;
       let after = 0;
@@ -514,7 +560,6 @@ export class SimNet implements SimulationNetwork {
       });
     } else if (learn.kind === "Ask") {
       const ans = learn.answer ?? null;
-      const points = (learn.citations ?? []).map((c) => c.snippet).slice(0, 1);
       this.history.push({
         at,
         kind: "Ask",
@@ -524,6 +569,9 @@ export class SimNet implements SimulationNetwork {
         pointNames: undefined,
       });
     }
+    // §11 保留策略：answers / history 只留最近 500 条
+    this.answers = keepRecent(this.answers, KEEP_RECENT);
+    this.history = keepRecent(this.history, KEEP_RECENT);
     this.persistState();
   }
 
@@ -554,6 +602,7 @@ export class SimNet implements SimulationNetwork {
     saveState(path.join(this.dataDir, "state.json"), this.state, this.kindState);
     saveAnswers(path.join(this.dataDir, "answers.json"), this.answers);
     saveHistory(path.join(this.dataDir, "history.json"), this.history);
+    saveDecisions(path.join(this.dataDir, "decisions.json"), this.decisions);
   }
 
   private loadGraph(file: string): void {
@@ -582,7 +631,7 @@ export class SimNet implements SimulationNetwork {
     }
 
     this.resources = g.resources ?? [];
-    this.graph = points.map((p, i) => ({
+    this.graph = points.map((p) => ({
       name: p.name,
       prev: (p.prevPids ?? []).map((x) => ({ name: points[x].name, pid: x })),
       resources: p.resources ?? [],

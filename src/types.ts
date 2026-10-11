@@ -73,6 +73,15 @@ export type LearnAction =
 /** 一个学习计划：按顺序学一串知识点，每个知识点带若干学习动作 */
 export type LearnPlan = Array<{ point: Point; actions: LearnAction[] }>;
 
+/**
+ * history 条目的类型。= LearnRecord 的 4 种（Ask / Read / Do / Skip）+ 一个额外项：
+ *   "Merge" —— mergePoints（§4.5）合并知识点。它不是一次"学习行为"，但**会改写掌握度**
+ *   （两个点的 state 合并成一个），属于必须留痕、可回放的**决策**，所以单列一类。
+ *   ⚠️ 早期实现把它记成 "Ask"，会污染 §8 用例 16 的 Ask 计数，已修正（2026-10-11）。
+ */
+export const NON_LEARN_HISTORY_KINDS = ["Merge"] as const;
+export type HistoryKind = LearnRecord["kind"] | (typeof NON_LEARN_HISTORY_KINDS)[number];
+
 export interface AnalyzeResReq {
   resource: Resource;
   points: Point[];
@@ -104,6 +113,9 @@ export const CHUNK_SIZE = 3000; // 长文切分粒度（字）
 export const VEC_SUFFICIENT_THRESHOLD = 0.45; // 向量模式：top1 相似度 >= 0.45 视为充足
 export const KEYWORD_COVERAGE_THRESHOLD = 0.5; // 关键词模式：词项覆盖率 >= 0.5
 export const UNCLASSIFIED_KIND = "未分类"; // 题型缺失的默认值
+export const KEEP_RECENT = 500; // §11：answers.json / history.json / decisions.json 只保留最近 500 条
+export const CONTEXT_ANSWERS = 5; // §11：上下文包注入该点的 AnswerRecord 最近 N=5 条
+export const CONTEXT_HISTORY = 5; // §11：上下文包注入相关 HistoryEntry 最近 M=5 条
 
 /** 一次真题作答的结构化记录（§4.7 规则 2 选"回炉题"要靠它，别只存人类可读文本） */
 export interface AnswerRecord {
@@ -117,11 +129,22 @@ export interface AnswerRecord {
 /** 一次学习行为的留痕（进阶项"区分偶然做错 / 稳定薄弱"与"决策回放"都靠它） */
 export interface HistoryEntry {
   at: string; // ISO 时间戳
-  kind: LearnRecord["kind"];
+  kind: HistoryKind;
   detail: string; // 人类可读摘要（问题 / 资料名 / 题目名 + 结果）
   pointNames?: string[]; // 涉及的知识点（归一化名）
   before?: number; // 变更前掌握度（仅 Do）
   after?: number; // 变更后掌握度（仅 Do）
+}
+
+/**
+ * §4.13 决策日志：模型提议被**拒绝**时必须留痕（拒绝原因 + 原始草稿）。
+ * 与 history 分开存，因为它是"系统拒绝了什么"，不是"用户学了什么"。
+ */
+export interface DecisionEntry {
+  at: string; // ISO 时间戳
+  action: "proposePlan.reject" | "proposePlan.accept";
+  reasons: string[]; // 拒绝理由（每条一个），accept 时为空数组
+  draft: unknown; // 原始草稿（原样留档，便于回放"模型到底提了什么"）
 }
 
 /** ask() 的返回（§4.10） */
@@ -151,13 +174,23 @@ export interface AIAssistant {
 }
 
 /** 在题面 trait 之上追加的 helper（题面明确允许自行添加，§1.3） */
-export interface LearningAssistant extends AIAssistant {
-  ask(question: string): Promise<AskResult>; // §4.10（L1 阶段可先按 §9.3 关键词降级实现）
+export interface PointMerger {
   mergePoints(from: Point, into: Point): void; // §4.5
 }
+/**
+ * 问答能力（§4.10）。**单独成接口**，因为它不由 SimNet 提供 ——
+ * 实现类是 qa.ts 的 QaEngine（问答需要"检索索引"这一份额外原料，
+ * 塞进 SimNet 会让知识网络同时管两件事）。
+ * 【2026-10-11 修正】早期把 ask 直接挂在 LearningAssistant 上、又让 SimNet implements 它，
+ * 导致 `SimNet` 缺 ask（tsc TS2420 + 运行时 undefined）。现在按"能力"拆开。
+ */
+export interface Asker {
+  ask(question: string): Promise<AskResult>;
+}
+export interface LearningAssistant extends AIAssistant, PointMerger, Asker {}
 
-/** L1 的模拟知识网络（不接 AI） */
-export interface SimulationNetwork extends LearningAssistant {
+/** L1 的模拟知识网络（不接 AI）。= 题面 trait 7 方法 + mergePoints（§4.5） */
+export interface SimulationNetwork extends AIAssistant, PointMerger {
   resources: Resource[];
   graph: PointGraph;
   pointMention: number[]; // pointMention[pid] = 该知识点被真题提及的次数（考频）
