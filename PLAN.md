@@ -735,6 +735,8 @@ node --experimental-strip-types --test tests/*.test.ts
 | 22 | **网页壳**上传一份带 `## 涉及知识点:` 的真题 | `extractedBy="rule"`、点数与声明一致，且进体系可查 |
 | 23 | 上传既**无声明**、presets 也**没有**的资料 | 如实返回 `points=0` + 可诊断的 `note`（**不假装成功、不写脏数据**） |
 | 24 | `SimNet.analyzeRes()` 的预设兜底目录 | 读的是 **`inputDir`**（输入侧），不被 `dataDir`（产物侧）带偏 |
+| 25 | **模型调用失败** + md **有**声明（把 `DEEPSEEK_BASE_URL` 指向不可达地址制造失败） | 来源如实标 **`rule`**（**不得**因为"回落结果也有 points"而谎报 `model`） |
+| 26 | 模型调用失败 + md **无**声明 + presets **有**命中 | 来源如实标 **`preset`**（不是 model、也不是 rule） |
 
 ---
 

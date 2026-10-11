@@ -31,7 +31,7 @@ node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8
 其他命令：
 
 ```bash
-node --experimental-strip-types --test tests/*.test.ts   # 29 条验收用例（含网页壳端到端）
+node --experimental-strip-types --test tests/*.test.ts   # 31 条验收用例（含网页壳端到端）
 node --experimental-strip-types demo/verify-persist.ts   # 另起进程读回持久化数据
 npm install && npm run typecheck                         # 可选：开发期静态类型自检（见 §9）
 ```
@@ -307,7 +307,7 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 - L3 学习状态（`state` + `kindState`）、计划动作填充、回炉题、模型提议校验/拒绝/回落 + 决策日志
 - 持久化（`graph` / `state` / `answers` / `history` / `decisions`，原子写 + 500 条裁剪 + 载入校验）
 - 网页壳（8 条 API + 3 个页面，含真上传）
-- `§8` 验收用例 **29 条**（含 4 条网页壳端到端：子进程起真实 server + 真发 HTTP）
+- `§8` 验收用例 **31 条**（含 6 条网页壳端到端：子进程起真实 server + 真发 HTTP，覆盖"模型挂了如何如实回落"）
 
 **未实现 / 已知限制**
 - **语义合并**（用 embedding 找同义知识点）默认**不做** —— 只做字符串归一 + 别名表。
