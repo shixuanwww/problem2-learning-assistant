@@ -838,7 +838,7 @@ node --experimental-strip-types demo/full-demo.ts   # 需 Key
 | 合并时机 | 默认**只做 integrate 时的入图前合并**；入图后合并用 `mergePoints`，不实现就抛错并在 README 声明（§4.5.1）；点入图前**先过 `data/aliases.json` 别名表再归一化**；合并产生的 `dead` 点不再算知识点（`topoOrder` / `makePlan` / `queryPoint` / 计数一律跳过） |
 | 网页「上传」 | `POST /api/upload`（JSON，非 multipart）**真上传**；`/api/files` + `/api/analyze` 用于分析已有文件（§4.12） |
 | 检索「不足」阈值 | 向量 `top1 >= 0.45`；关键词 `命中片段 >= 1 且 词项覆盖率 >= 0.5`（§4.10，需写进 README）；**有 Key 时模型只能把 `sufficient` 降为 false，不得升高** |
-| 掌握度排序键 | `(已掌握 ? 1 : 0, 掌握度, -考频, normalize(name) 码点序)`，层内升序（§4.2 🔑） |
+| 掌握度排序键 | `(已掌握 ? 0 : 1, 掌握度, -考频, normalize(name) 码点序)`，层内升序（**已掌握排最后**；§4.2 🔑） |
 | **`state` / `kindState` 落盘** | **不得直接 `JSON.stringify(Map)`**（会得到 `{}`，状态静默丢光）；一律走 `stateToJSON` / `stateFromJSON`（§3 / §4.8） |
 | **`answers.json` 保留策略** | 存 `AnswerRecord[]`；与 `history.json` 同策略：**保留最近 500 条**（超出按 `at` 裁剪）并在 README 写明（附二 3） |
 | 上下文包注入条数 | 该点的 `AnswerRecord` 取**最近 5 条**（N=5）、`HistoryEntry` 取**最近 5 条**（M=5）（§4.10 已同步写定 N=5 / M=5，与本表一致） |
