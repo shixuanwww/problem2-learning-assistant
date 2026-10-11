@@ -6,20 +6,36 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { SimNet } from "../src/network.ts";
-import { makeNetWithProblems, makeTempDir } from "./helpers.ts";
+import { makeNetWithProblems, makeTempDir, spawnBlockedReason } from "./helpers.ts";
 
-test("用例11：另起一个进程跑 demo/verify-persist.ts → 学习状态仍在（跨进程持久化）", () => {
+test("用例11：另起一个进程跑 demo/verify-persist.ts → 学习状态仍在（跨进程持久化）", (t) => {
   const dir = makeTempDir();
   const net = makeNetWithProblems(dir);
   // 记录一条作答，让 state.json 有内容
   const problem = net.problemByName("2023 期末 第1题")!;
   net.record({ kind: "Do", problem, status: "incorrect" });
 
-  const out = execFileSync(
-    process.execPath,
-    ["--experimental-strip-types", "demo/verify-persist.ts"],
-    { env: { ...process.env, T2_RUNTIME_DIR: dir }, encoding: "utf8" },
-  );
+  let out: string;
+  try {
+    out = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "demo/verify-persist.ts"],
+      {
+        // 🔴 stdio 必须**显式**给：受限环境（本机沙箱即如此）下"不传 stdio"会让 spawn 直接 EBUSY，
+        //    显式写 ["ignore","pipe","pipe"] 反而正常，且仍能拿到 stdout 做断言。
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, T2_RUNTIME_DIR: dir },
+        encoding: "utf8",
+      },
+    );
+  } catch (e) {
+    const why = spawnBlockedReason(e);
+    if (why) {
+      t.skip(`${why} ⇒ 跨进程持久化在本机无法验证（环境限制，非代码缺陷）`);
+      return;
+    }
+    throw e; // 起来了却失败 = 真回归，必须照抛
+  }
   assert.ok(out.includes("PASS"), `verify-persist 应 PASS：\n${out}`);
   assert.ok(out.includes("0.25"), "应跨进程读到掌握度 0.25");
 });

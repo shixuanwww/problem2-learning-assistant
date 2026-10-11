@@ -165,8 +165,11 @@ async function main() {
   // 另起一个进程读回 state.json，证明真落盘
   console.log(`\n  —— 另起一个进程跑 demo/verify-persist.ts ——`);
   try {
+    // 🔴 stdio 必须**显式**给：受限环境（本机沙箱）下"不传 stdio"会让 spawn 直接 EBUSY；
+    //    显式写 ["ignore","pipe","pipe"] 才正常，且仍能读到子进程的 stdout。
     const out = execFileSync(process.execPath, ["--experimental-strip-types", "demo/verify-persist.ts"], {
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, T2_DATA_DIR: DATA, T2_RUNTIME_DIR: RUNTIME },
     });
     console.log(out.trim());

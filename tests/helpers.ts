@@ -15,6 +15,26 @@ export function makeTempDir(): string {
   return mkdtempSync(path.join(tmpdir(), "t2-test-"));
 }
 
+// ---------------------------------------------------------------------------
+// 子进程用例的环境兜底
+// ---------------------------------------------------------------------------
+// 背景：用例 11/12 与网页壳端到端要**另起一个进程**验证跨进程持久化 / "模型挂了如何回落"，
+//       这比在同进程读内存强得多，所以必须真起子进程。
+// 部分受限环境（沙箱 / 企业策略 / 杀软）会直接让 spawn 失败 ⇒ 此时用例无法验证，
+// 应如实 skip 并说明原因，而不是留一条红让人误判成"代码坏了"。
+//
+// 🔴 关键边界：只把「子进程根本没起来」判为环境问题。
+//    子进程起来了、只是退出码非 0（或断言失败）一律照抛 ——
+//    否则真回归会被伪装成 skip 混过去（这正是兜底最容易帮倒忙的地方）。
+export function spawnBlockedReason(e: unknown): string | null {
+  const err = e as NodeJS.ErrnoException & { status?: number | null };
+  // status 是数字 ⇒ 进程成功起来了，是它自己失败 ⇒ 真失败，不是环境问题
+  if (typeof err.status === "number") return null;
+  const code = err.code ?? "";
+  const envCodes = ["EBUSY", "EPERM", "EACCES", "EMFILE", "ENFILE", "EAGAIN", "UNKNOWN"];
+  return envCodes.includes(code) ? `本机不允许派生子进程（spawn ${code}）` : null;
+}
+
 function matReq(resource: string, points: string[], edges: Array<[string, string]>): AnalyzeResReq {
   return {
     resource,
