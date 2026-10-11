@@ -1,0 +1,18 @@
+{
+  "name": "problem2-learning-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "题2《AI 学习辅助网页》— 零第三方依赖的 TypeScript 实现（CLI 演示 + 本地网页加分项）",
+  "type": "module",
+  "scripts": {
+    "demo": "node --experimental-strip-types demo/l1-demo.ts",
+    "demo:full": "node --env-file=.env --experimental-strip-types demo/full-demo.ts",
+    "demo:persist": "node --experimental-strip-types demo/verify-persist.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "serve": "node --env-file=.env --experimental-strip-types src/server.ts",
+    "start": "node --experimental-strip-types demo/l1-demo.ts"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

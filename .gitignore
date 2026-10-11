@@ -1,0 +1,18 @@
+# 运行时生成的数据（持久化产物）
+data/state.json
+data/graph.json
+data/answers.json
+data/history.json
+
+# 密钥（绝不入库）
+.env
+.env.*
+!/.env.example
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log

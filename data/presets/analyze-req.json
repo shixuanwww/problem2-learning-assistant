@@ -1,0 +1,20 @@
+{
+  "说明": "兜底分析结果：当 md 里没有显式写 ## 知识点: / ## 前置: 关系声明时的 fallback（§4.11 路 B）。l1-demo 优先用 md 里的声明，此处仅供无声明时抽不到点的情形兜底。",
+  "resources": [
+    {
+      "resource": "data/materials/m01-integers.md",
+      "points": [{ "name": "整数加减" }, { "name": "整数乘除" }],
+      "edges": [[{ "name": "整数加减" }, { "name": "整数乘除" }]]
+    },
+    {
+      "resource": "data/materials/m02-fractions.md",
+      "points": [{ "name": "分数" }, { "name": "分数加减" }],
+      "edges": [[{ "name": "分数" }, { "name": "分数加减" }]]
+    },
+    {
+      "resource": "data/materials/m03-decimals.md",
+      "points": [{ "name": "小数" }, { "name": "小数加减" }],
+      "edges": [[{ "name": "小数" }, { "name": "小数加减" }]]
+    }
+  ]
+}
