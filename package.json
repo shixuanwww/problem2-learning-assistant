@@ -5,12 +5,12 @@
   "description": "题2《AI 学习辅助网页》— 零第三方运行时依赖的 TypeScript 实现（CLI 演示 + 本地网页）",
   "type": "module",
   "scripts": {
-    "demo": "node --experimental-strip-types demo/l1-demo.ts",
-    "demo:full": "node --experimental-strip-types demo/full-demo.ts",
-    "demo:persist": "node --experimental-strip-types demo/verify-persist.ts",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "serve": "node --experimental-strip-types src/server.ts",
-    "start": "node --experimental-strip-types demo/l1-demo.ts",
+    "demo": "node bin/run.mjs demo/l1-demo.ts",
+    "demo:full": "node bin/run.mjs demo/full-demo.ts",
+    "demo:persist": "node bin/run.mjs demo/verify-persist.ts",
+    "test": "node bin/run.mjs --test tests/*.test.ts",
+    "serve": "node bin/run.mjs src/server.ts",
+    "start": "node bin/run.mjs demo/l1-demo.ts",
     "typecheck": "tsc -p tsconfig.typecheck.json"
   },
   "engines": {

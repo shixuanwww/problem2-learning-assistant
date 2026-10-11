@@ -12,16 +12,27 @@
 ## 1. 启动方式
 
 ```bash
-node --version            # 自检：必须 >= 22.6（本项目用 --experimental-strip-types）
-node --experimental-strip-types demo/l1-demo.ts      # 保底演示：零依赖、离线可跑，走完题面 5 步
-node --experimental-strip-types demo/full-demo.ts    # 完整演示：接模型抽取 + 模型问答
+node --version        # ⚠ 先看这条：需要 Node ≥ 22.6（本项目用 Node 的"类型擦除"直接跑 .ts）
+npm run demo          # ⭐ 保底演示：零依赖、离线可跑、确定性输出，走完题面 5 步
+npm run demo:full     # 完整演示：模型抽取 + 带出处问答 + 模型提议计划（无 Key 自动降级）
+npm run serve         # 网页壳（9 条 API + 3 个页面）→ http://127.0.0.1:8787
+npm test              # 44 条验收用例（含网页壳端到端）
 ```
 
-可选（网页壳，9 条 API + 三个页面）：
+等价的手写命令（不想用 npm scripts 时）：
 
 ```bash
+node --experimental-strip-types demo/l1-demo.ts      # 保底演示（零依赖、离线）
+node --experimental-strip-types demo/full-demo.ts    # 完整演示（真调模型）
 node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8787
 ```
+
+> 🔧 **`npm run *` 都经过 `bin/run.mjs`**：它按 Node 版本选调用方式（22.6–23.5 加 `--experimental-strip-types`，
+> ≥23.6 直接跑），版本不够时**给出照做就能跑的 nvm / Docker 命令**，而不是丢一句
+> `bad option: --experimental-strip-types`。Node 20/18 上可以直接用：
+> `docker run --rm -v "$PWD:/app" -w /app node:22 node --experimental-strip-types demo/l1-demo.ts`
+> （Windows PowerShell 把 `"$PWD:/app"` 换成 `"${PWD}:/app"`）。
+> ⚠️ 所有命令都请在**仓库根目录**执行（`data/` 与 `.env` 都按当前目录解析）。
 
 > ⚠️ **不要用 `node --env-file=.env …`**：`.env` 不存在时 Node 会**直接退出**（`Error: .env: not found`），
 > 那样就谈不上"无 Key 优雅降级"了。本项目由 `src/analyze/llm.ts` **自己**读仓库根的 `.env`
@@ -31,8 +42,7 @@ node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8
 其他命令：
 
 ```bash
-node --experimental-strip-types --test tests/*.test.ts   # 44 条验收用例（含网页壳端到端）
-node --experimental-strip-types demo/verify-persist.ts   # 另起进程读回持久化数据
+npm run demo:persist                                     # 另起进程读回持久化数据（证明真落盘）
 npm install && npm run typecheck                         # 可选：开发期静态类型自检（见 §9）
 ```
 
@@ -282,6 +292,8 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 | 5 | 重新 `makePlan()` | 该薄弱点**动作数增加**（主题 + 回炉题），并说明变化仍在拓扑序允许范围内 |
 | 5·续 | **多轮**：连续答对跨过 `0.80` 阈值 → 同一道题再错一次 | ① 该点被**排到同层最后**、动作收敛为一道巩固题（"降低已掌握内容优先级"）；② 答错记录 2 条 ⇒ 判为**稳定薄弱**，回炉题继续加量 |
 | 附 | **模型提议被拒 → 回落规则版计划** | 故意喂一条非法提议，打印每条拒绝理由 + 决策日志 + 回落后的计划（§4.13） |
+
+📄 **现场演示照这份走**：`docs/演示脚本.md`（一页纸：命令 + 每步看点 + 口播要点 + 失败预案 + 8 个可能被追问的问题索引）。
 
 🔁 **演示是幂等的**：输入读 `data/`（只读），产物写 `data/.runtime/`（每次启动前清空）
 ⇒ 第 N 次跑和第 1 次输出**完全一致**（`l1-demo` 另外强制 `offline`，**连"本机恰好有 Key"都不会影响输出**）。
