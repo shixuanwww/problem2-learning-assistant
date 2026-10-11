@@ -86,47 +86,66 @@ type ExtractedBy = "model" | "preset" | "rule";
  *   以前上传只走 `materialReq()`（纯规则解析 `## 知识点:`），
  *   ⇒ 真实课件转出来的 md（没有声明）上传后**静默得到 0 个知识点**，
  *     L2 的"接模型解析资料"在网页上完全演不出来。
- *   现在：有 Chat Key ⇒ **先调模型**（analyzeRes → analyze.ts 路 A），失败再回落
- *   预置（presets）→ 最后才是声明解析；没 Key 就跳过模型，直接 preset → rule。
- *   结果里带 `extractedBy`，界面/日志能看见到底是谁抽的。
+ *
+ * 现在按 模型（`net.analyzeResDetailed`）→ md 声明 → presets 逐级回落，
+ * **每一步的来源都如实带出来**（`by`）—— 修前只看"有没有 points"会把
+ * "模型挂了、回落 md 声明"的结果标成 model，是假日志（审计实测抓到）。
  */
 async function extractMaterial(file: string): Promise<{ req: AnalyzeResReq; by: ExtractedBy; note?: string }> {
-  if (hasChatKey()) {
-    try {
-      const req = await net.analyzeRes(file);
-      if (req.points.length > 0) return { req, by: "model" };
-      // 模型没抽出点（罕见）：继续往下回落
-      return fallbackMaterial(file, "模型未抽出任何知识点");
-    } catch (e) {
-      return fallbackMaterial(file, String(e));
+  let modelErr = "";
+  try {
+    const d = await net.analyzeResDetailed(file); // 内部首选模型（preferModel: true）
+    // ⚠️ 必须看 d.by：模型失败时它会**内部回落到 md 声明**并返回非空 points，
+    //    只看"有没有 points"就会把规则解析的结果标成 model（审计实测抓到的假日志）。
+    if (d.by === "model" && d.req.points.length > 0) return d;
+    if (d.req.points.length > 0 || d.req.edges.length > 0) {
+      return { req: d.req, by: d.by, note: d.note ?? "模型未抽出任何知识点" };
     }
+    modelErr = d.note ?? "模型未抽出任何知识点";
+  } catch (e) {
+    modelErr = String(e); // 模型不可用 且 md 也没声明
   }
-  return fallbackMaterial(file, "未配置 DEEPSEEK_API_KEY");
-}
 
-function fallbackMaterial(file: string, why: string): { req: AnalyzeResReq; by: ExtractedBy; note: string } {
   const preset = loadPreset(DATA, file);
   if (preset) {
-    console.warn(`[server] ${file} 未走模型（${why.slice(0, 60)}）⇒ 用 presets 预置结果兜底`);
-    return { req: preset, by: "preset", note: why };
+    console.warn(`[server] ${file} 未能走模型 ⇒ 用 presets 预置结果兜底（原因：${shortReason(modelErr)}）`);
+    return { req: preset, by: "preset", note: modelErr };
   }
   const rule = materialReq(file);
-  return { req: rule, by: "rule", note: `${why}${rule.points.length ? "" : "（该资料无 md 声明，抽出 0 点）"}` };
+  return {
+    req: rule,
+    by: "rule",
+    note: rule.points.length > 0
+      ? modelErr
+      : `${modelErr}；该 md 也没有关系声明，抽出 0 点（建议：转 md 时保留「## 知识点:」声明，或配置 DEEPSEEK_API_KEY 走模型）`,
+  };
+}
+
+/**
+ * 把内部错误压成日志/响应里能看的一小段：
+ * 只留第一行 + 压空白 + 截断到 60 字 —— 避免把 HTTP 响应体（可能含 key 提示）整段打出来。
+ */
+function shortReason(reason: string): string {
+  return reason.split("\n")[0].replace(/\s+/g, " ").slice(0, 60);
 }
 
 /** 真题同理：优先让模型判断"这题考哪些知识点"，失败才回落 md 里的 `## 涉及知识点:`。 */
 async function extractProblem(file: string): Promise<{ problem: Problem; points: Point[]; by: ExtractedBy; note?: string }> {
   const problem = problemFromFile(file);
-  if (hasChatKey()) {
-    try {
-      const req = await net.analyzePro(problem);
-      if (req.points.length > 0) return { problem, points: req.points, by: "model" };
-      return { problem, points: problem.points, by: "rule", note: "模型未抽出任何知识点" };
-    } catch (e) {
-      return { problem, points: problem.points, by: "rule", note: String(e) };
+  try {
+    const d = await net.analyzeProDetailed(problem); // 内部首选模型（preferModel: true）
+    // 与 extractMaterial 同理：必须看 d.by —— 题目本身带 points 时，
+    // "回落声明"也会返回非空 points。修的若是这个判断，日志就会谎报 model。
+    if (d.by === "model" && d.req.points.length > 0) {
+      return { problem, points: d.req.points, by: "model" };
     }
+    if (d.req.points.length > 0) {
+      return { problem, points: d.req.points, by: d.by, note: d.note ?? "模型未抽出任何知识点" };
+    }
+  } catch (e) {
+    return { problem, points: problem.points, by: "rule", note: String(e) };
   }
-  return { problem, points: problem.points, by: "rule", note: "未配置 DEEPSEEK_API_KEY" };
+  return { problem, points: problem.points, by: "rule", note: "模型未抽出任何知识点" };
 }
 
 /** 接入一份资料：抽取 → integrate。返回抽取来源，便于日志/响应展示。 */
@@ -151,14 +170,21 @@ async function bootstrap(): Promise<void> {
   }
   for (const m of collectMdFiles(`${DATA}/materials`).sort()) {
     const r = await ingestMaterial(m);
-    const tail = r.note && r.by !== "model" ? `（${r.note.slice(0, 60)}）` : "";
-    console.log(`  接入资料 ${m} ← ${r.by}｜${r.points} 个知识点 / ${r.edges} 条前置边${tail}`);
+    // ⚠️ 只有真的走了模型才写 model：回落时必须把来源（preset / rule）与原因一起打出来，
+    //    否则"配了 Key 但 Key 无效"这种情况会被日志显示成"模型抽取成功"，属于误导性日志。
+    console.log(`  接入资料 ${m} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点 / ${r.edges} 条前置边`);
     if (r.points === 0) console.warn(`  ⚠ ${m} 没能抽出任何知识点，请检查该 md 或上传格式`);
   }
   for (const p of collectMdFiles(`${DATA}/problems`).sort().filter((f) => f.endsWith(".prob.md"))) {
     const r = await ingestProblem(p);
-    console.log(`  接入真题 ${p} ← ${r.by}｜${r.points} 个知识点`);
+    console.log(`  接入真题 ${p} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点`);
   }
+}
+
+/** 把"为什么没走模型"的原因压成日志里能看的一小段（模型成功时为空）。 */
+function describeNote(by: ExtractedBy, note?: string): string {
+  if (by === "model" || !note) return "";
+  return `（${note.replace(/\s+/g, " ").slice(0, 80)}）`;
 }
 // ⚠️ bootstrap 是 async（有 Key 时要逐份调模型）⇒ 不能在这里裸调；
 //    移到 server.listen 回调里跑，避免"路由已能响应但体系还没建好"的中间态被看到。

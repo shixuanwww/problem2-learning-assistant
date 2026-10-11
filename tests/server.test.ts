@@ -33,8 +33,7 @@ function makeFixtureDataDir(opts: { withPreset: boolean }): string {
     path.join(dataDir, "materials", "m01.md"),
     "# 整数运算\n\n## 知识点: 整数加减, 整数乘除\n## 前置: 整数加减 -> 整数乘除\n\n## 1 整数加减法\n进位与退位。\n",
     "utf8",
-  );
-  writeFileSync(
+  );  writeFileSync(
     path.join(dataDir, "problems", "p01.prob.md"),
     "# 2023 期末 第1题\n## 题型: 计算\n## 涉及知识点: 整数加减\n23 + 45 = ?\n",
     "utf8",
@@ -63,7 +62,7 @@ function makeFixtureDataDir(opts: { withPreset: boolean }): string {
 }
 
 /** 起 server 子进程，等 listen 日志出现（最多 20s）。 */
-async function startServer(dataDir: string, runtimeDir: string): Promise<ChildProcess> {
+async function startServer(dataDir: string, runtimeDir: string, extraEnv: Record<string, string> = {}): Promise<ChildProcess> {
   const child = spawn(process.execPath, ["--experimental-strip-types", "src/server.ts"], {
     env: {
       ...process.env,
@@ -72,6 +71,7 @@ async function startServer(dataDir: string, runtimeDir: string): Promise<ChildPr
       T2_RUNTIME_DIR: runtimeDir,
       DEEPSEEK_API_KEY: "",
       ZHIPU_API_KEY: "",
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -180,6 +180,54 @@ test("用例23：既无声明、presets 也没有 ⇒ 如实返回 0 点 + 可�
     assert.equal(r.ok, true);
     assert.equal(r.points, 0, "没有 Key / 预置时确实抽不出点，不应谎报");
     assert.ok(String(r.note).length > 0, "必须在 note 里说明为什么抽不出（可诊断）");
+  } finally {
+    await stopServer(child);
+  }
+});
+
+test("用例25：模型不可用时来源必须如实标注（模型挂 + md 有声明 ⇒ rule，不能谎报 model）", async () => {
+  const dataDir = makeFixtureDataDir({ withPreset: true });
+  const runtime = makeTempDir();
+  // 有 Key（所以会真的尝试走模型）+ 把 base URL 指向打不通的地址 ⇒ 模型必然失败
+  const child = await startServer(dataDir, runtime, {
+    DEEPSEEK_API_KEY: "sk-intentionally-invalid",
+    DEEPSEEK_BASE_URL: "http://127.0.0.1:9/unreachable",
+  });
+  try {
+    // ① 材料 md **有**声明（夹具 m01.md）⇒ 模型失败后回落声明，来源应为 rule（不能是 model）
+    const m = await postJSON("/api/analyze", { file: `${dataDir.replace(/\\/g, "/")}/materials/m01.md` });
+    assert.equal(m.extractedBy, "rule", `模型失败后应标 rule，实际 ${String(m.extractedBy)}`);
+    assert.ok(Number(m.points) > 0, "回落声明后仍应抽到知识点");
+
+    // ② 同一份 md 但**没有** presets 命中项、模型也挂 ⇒ 如实 0 点 + note 说明原因
+    const m2 = await postJSON("/api/upload", {
+      name: "_test-nodecl2",
+      target: "materials",
+      content: "# 无声明也无预置\n\n正文而已。\n",
+    });
+    assert.equal(m2.extractedBy, "rule");
+    assert.equal(m2.points, 0, "抽不出就如实 0 点");
+    assert.match(String(m2.note), /DEEPSEEK|模型|fetch|HTTP/, "note 应说明为什么没走成模型");
+  } finally {
+    await stopServer(child);
+  }
+});
+
+test("用例26：模型挂 + 无声明 + **有 presets 命中** ⇒ 来源标 preset（不是 model 也不是 rule）", async () => {
+  const dataDir = makeFixtureDataDir({ withPreset: true });
+  const runtime = makeTempDir();
+  const child = await startServer(dataDir, runtime, {
+    DEEPSEEK_API_KEY: "sk-intentionally-invalid",
+    DEEPSEEK_BASE_URL: "http://127.0.0.1:9/unreachable",
+  });
+  try {
+    const r = await postJSON("/api/upload", {
+      name: "_test-nodecl",
+      target: "materials",
+      content: "# 几何初步\n\n正文，没有关系声明。\n",
+    });
+    assert.equal(r.extractedBy, "preset", `应标 preset，实际 ${String(r.extractedBy)}`);
+    assert.ok(Number(r.points) > 0, "presets 兜底应给出知识点");
   } finally {
     await stopServer(child);
   }
