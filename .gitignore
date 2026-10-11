@@ -1,8 +1,12 @@
 # 运行时生成的数据（持久化产物）
+#   现在所有产物都写到 data/.runtime/（输入 data/materials、data/problems 保持只读），
+#   所以整个 .runtime 目录直接忽略；下面 4 行是历史位置，保留以防手改 dataDir。
+data/.runtime/
 data/state.json
 data/graph.json
 data/answers.json
 data/history.json
+data/decisions.json
 
 # 密钥（绝不入库）
 .env

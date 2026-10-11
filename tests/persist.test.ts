@@ -18,7 +18,7 @@ test("用例11：另起一个进程跑 demo/verify-persist.ts → 学习状态�
   const out = execFileSync(
     process.execPath,
     ["--experimental-strip-types", "demo/verify-persist.ts"],
-    { env: { ...process.env, DATA_DIR: dir }, encoding: "utf8" },
+    { env: { ...process.env, T2_RUNTIME_DIR: dir }, encoding: "utf8" },
   );
   assert.ok(out.includes("PASS"), `verify-persist 应 PASS：\n${out}`);
   assert.ok(out.includes("0.25"), "应跨进程读到掌握度 0.25");

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>问答 · AI 学习辅助系统</title>
+<style>
+  :root { --fg:#1a1d21; --muted:#666; --line:#e3e6ea; --bg:#f7f8fa; --accent:#1f6feb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 24px; display:flex; gap:20px; align-items:center; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  nav a { color:var(--muted); text-decoration:none; margin-right:14px; font-size:14px; }
+  nav a.on { color:var(--accent); font-weight:600; }
+  main { max-width:880px; margin:0 auto; padding:24px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; }
+  input { font:inherit; padding:9px 11px; border:1px solid var(--line); border-radius:7px; width:100%; background:#fff; }
+  button { font:inherit; padding:9px 16px; border-radius:7px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  .row { display:flex; gap:10px; }
+  .ans { white-space:pre-wrap; }
+  .cite { border-left:3px solid var(--accent); padding:6px 12px; margin:8px 0; background:#f8fafc; font-size:13.5px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:12px; font-weight:600; }
+  .ok { background:#e6f6ec; color:#186a3b; }
+  .no { background:#fdecea; color:#a12b1e; }
+  .ex { cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI 学习辅助系统</h1>
+  <nav>
+    <a href="/">知识体系</a>
+    <a class="on" href="/ask">问答</a>
+    <a href="/learn">学习计划与记录</a>
+  </nav>
+</header>
+<main>
+  <div class="card">
+    <h2>基于资料的带出处问答</h2>
+    <p class="sub">
+      只依据 <code>data/materials/</code> 里的资料回答，<b>资料不足时直接拒答</b>（不用模型自身知识补全）。
+      还可以试试问一个资料里没有的问题，看它怎么拒。
+    </p>
+    <div class="row">
+      <input id="q" placeholder="例如：整数加减法是什么" />
+      <button id="askBtn">提问</button>
+    </div>
+    <p class="sub ex" style="margin-top:8px">
+      示例：<a href="#" data-q="整数加减法是什么">整数加减法是什么</a> ·
+      <a href="#" data-q="分数加减怎么通分">分数加减怎么通分</a> ·
+      <a href="#" data-q="二次根式怎么化简">二次根式怎么化简（资料里没有）</a>
+    </p>
+  </div>
+  <div class="card" id="out" style="display:none">
+    <h2>回答</h2>
+    <div id="meta" class="sub"></div>
+    <p class="ans" id="ans"></p>
+    <h2 style="margin-top:16px">出处（citations）</h2>
+    <div id="cites"></div>
+  </div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+async function ask(question) {
+  $("#out").style.display = "block";
+  $("#ans").textContent = "…";
+  $("#cites").innerHTML = "";
+  $("#meta").textContent = "";
+  const r = await fetch("/api/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+  const d = await r.json();
+  if (d.error) { $("#ans").textContent = "错误：" + d.error; return; }
+  $("#meta").innerHTML =
+    `<span class="pill ${d.sufficient ? "ok" : "no"}">sufficient = ${d.sufficient}</span>` +
+    (d.fallback ? `　<span class="sub">降级路径：${d.fallback}</span>` : "");
+  $("#ans").textContent = d.answer === null ? "【资料不足，拒绝编造】" : d.answer;
+  $("#cites").innerHTML = d.citations.map((c, i) =>
+    `<div class="cite"><b>[${i + 1}] ${c.resource}</b> <span class="sub">/ ${c.locator}</span><br>${c.snippet}</div>`
+  ).join("") || '<span class="sub">无</span>';
+}
+$("#askBtn").onclick = () => { const v = $("#q").value.trim(); if (v) ask(v); };
+$("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#askBtn").click(); });
+document.querySelectorAll("[data-q]").forEach((a) => a.onclick = (e) => {
+  e.preventDefault(); $("#q").value = a.dataset.q; ask(a.dataset.q);
+});
+</script>
+</body>
+</html>

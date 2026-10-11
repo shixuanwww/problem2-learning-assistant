@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>学习计划与记录 · AI 学习辅助系统</title>
+<style>
+  :root { --fg:#1a1d21; --muted:#666; --line:#e3e6ea; --bg:#f7f8fa; --accent:#1f6feb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 24px; display:flex; gap:20px; align-items:center; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  nav a { color:var(--muted); text-decoration:none; margin-right:14px; font-size:14px; }
+  nav a.on { color:var(--accent); font-weight:600; }
+  main { max-width:980px; margin:0 auto; padding:24px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:4px; background:#eef2f7; color:#3b4652; font-size:12px; margin-right:5px; }
+  .act-Read { background:#e8f1fd; color:#14498f; }
+  .act-Explain { background:#f0ecfd; color:#4a2f9e; }
+  .act-Do { background:#e9f6ec; color:#186a3b; }
+  select,input,button { font:inherit; padding:8px 11px; border-radius:7px; border:1px solid var(--line); background:#fff; }
+  button { border-color:var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  pre { background:#0f1115; color:#e6e6e6; padding:12px; border-radius:8px; overflow:auto; font-size:12.5px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI 学习辅助系统</h1>
+  <nav>
+    <a href="/">知识体系</a>
+    <a href="/ask">问答</a>
+    <a class="on" href="/learn">学习计划与记录</a>
+  </nav>
+</header>
+<main>
+  <div class="card">
+    <h2>学习计划（拓扑序 + 层内按 掌握度/考频 排序）</h2>
+    <p class="sub">顺序满足 <code>from → to</code>：前置知识点必须排在后继之前。已掌握的点排后面，只需巩固。</p>
+    <div id="plan">加载中…</div>
+  </div>
+
+  <div class="card">
+    <h2>记录一次作答（会立刻改变掌握度，并影响上面的计划）</h2>
+    <div class="row">
+      <label class="sub">真题</label><select id="prob"></select>
+      <label class="sub">结果</label>
+      <select id="status">
+        <option value="incorrect">incorrect（−0.25）</option>
+        <option value="correct">correct（+0.15）</option>
+        <option value="confuse">confuse（−0.05）</option>
+      </select>
+      <button id="recBtn">记录</button>
+      <button class="ghost" id="reloadBtn">刷新</button>
+    </div>
+    <p class="sub" style="margin-top:10px">记录后再看上面的计划：该点会多出一道「回炉题」（动作数增加），这就是题面第 5 步"AI 依据学习表现调整计划"。</p>
+    <pre id="recOut" style="display:none"></pre>
+  </div>
+
+  <div class="card">
+    <h2>状态快照</h2>
+    <div id="snap" class="sub">加载中…</div>
+  </div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const api = async (u, o) => (await fetch(u, o)).json();
+const badge = (k) => `<span class="tag act-${k}">${k === "Read" ? "读资料" : k === "Explain" ? "讲解" : "做题"}</span>`;
+
+async function loadPlan() {
+  const d = await api("/api/plan");
+  const rows = d.plan.map((it, i) => `<tr>
+    <td class="sub">${i + 1}</td>
+    <td><b>${it.point}</b>${it.mastery === null ? ' <span class="sub">（未学）</span>' : ` <span class="sub">(${it.mastery.toFixed(2)})</span>`}</td>
+    <td>${it.actions.map((a) => badge(a.kind) + (a.problem ? `<span class="sub">${a.problem}</span>` : a.resource ? `<span class="sub">${a.resource.split("/").pop()}</span>` : "")).join(" ")}</td>
+  </tr>`).join("");
+  $("#plan").innerHTML = `<table><thead><tr><th>#</th><th>知识点</th><th>学习动作</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  const g = await api("/api/graph");
+  // 真题下拉直接用 Problem.name（来自 md 的 # 标题），保证与后端 problemByName 的匹配口径一致
+  $("#prob").innerHTML = g.problems.map((p) => `<option value="${p.name}">${p.name} · ${p.kind}</option>`).join("");
+  const st = Object.entries(g.kindState ?? {}).map(([k, v]) => `${k}=${Number(v).toFixed(2)}`).join("、");
+  $("#snap").innerHTML =
+    `知识点掌握度：` + (g.points.filter((p) => p.mastery !== null).map((p) => `${p.name}=${p.mastery.toFixed(2)}`).join("、") || "（暂无记录）") +
+    `<br>题型掌握度：` + (st || "（暂无记录，记录一次作答后可看到）");
+}
+
+$("#recBtn").onclick = async () => {
+  // 真题的 name 取自 md 里的 # 标题，这里用下拉值直接匹配（名称一致）
+  const out = await api("/api/record", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "Do", problemName: $("#prob").value, status: $("#status").value }),
+  });
+  const el = $("#recOut");
+  el.style.display = "block";
+  el.textContent = JSON.stringify(out, null, 2);
+  loadPlan();
+};
+$("#reloadBtn").onclick = loadPlan;
+loadPlan();
+</script>
+</body>
+</html>

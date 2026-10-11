@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>知识体系 · AI 学习辅助系统</title>
+<style>
+  :root { --fg:#1a1d21; --muted:#666; --line:#e3e6ea; --bg:#f7f8fa; --accent:#1f6feb; --warn:#b7791f; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.65 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 24px; display:flex; gap:20px; align-items:center; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  nav a { color:var(--muted); text-decoration:none; margin-right:14px; font-size:14px; }
+  nav a.on { color:var(--accent); font-weight:600; }
+  main { max-width:1080px; margin:0 auto; padding:24px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  .bar { height:6px; background:#eceff3; border-radius:3px; overflow:hidden; width:90px; display:inline-block; vertical-align:middle; }
+  .bar i { display:block; height:100%; background:var(--accent); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:4px; background:#eef2f7; color:#3b4652; font-size:12px; margin:0 4px 3px 0; }
+  .warn { border:1px solid #e6c78a; background:#fdf7ea; color:#6b4d0b; padding:10px 12px; border-radius:8px; font-size:13px; }
+  button { font:inherit; padding:7px 14px; border-radius:7px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  textarea,input,select { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:7px; width:100%; background:#fff; }
+  pre { background:#0f1115; color:#e6e6e6; padding:12px; border-radius:8px; overflow:auto; font-size:12.5px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI 学习辅助系统</h1>
+  <nav>
+    <a class="on" href="/">知识体系</a>
+    <a href="/ask">问答</a>
+    <a href="/learn">学习计划与记录</a>
+  </nav>
+</header>
+<main>
+  <div class="card">
+    <h2>总览</h2>
+    <div id="summary" class="sub">加载中…</div>
+  </div>
+
+  <div id="warnBox"></div>
+
+  <div class="card">
+    <h2>知识点网络（前置边 + 掌握度 + 考频）</h2>
+    <p class="sub">掌握度为空 = 还没学过（冷启动先验 0.5）。考频 = 该知识点被历年真题提及的次数。</p>
+    <div id="graph">加载中…</div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>考频榜 · top 10</h2>
+      <div id="rank" class="sub">加载中…</div>
+    </div>
+    <div class="card">
+      <h2>题库 / 资料库</h2>
+      <div id="files" class="sub">加载中…</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>上传资料 / 真题（真落盘 + 自动分析）</h2>
+    <p class="sub">走 JSON 上传：浏览器读文件文本 → POST /api/upload → 落盘到 data/ → 自动 analyze → integrate。文件名不允许含路径分隔符。</p>
+    <div class="grid2">
+      <div>
+        <label class="sub">类型</label>
+        <select id="target"><option value="materials">资料（materials）</option><option value="problems">真题（problems）</option></select>
+        <label class="sub" style="display:block;margin-top:10px">文件名（可省 .md）</label>
+        <input id="fname" placeholder="例如 m04-geometry" />
+      </div>
+      <div>
+        <label class="sub">内容（Markdown）</label>
+        <textarea id="fcontent" rows="7" placeholder="## 知识点: 几何初步&#10;## 前置: 整数乘除 -> 几何初步&#10;&#10;## 1 几何初步&#10;正文…"></textarea>
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:10px">
+      <button id="uploadBtn">上传并接入</button>
+      <button class="ghost" id="reloadBtn">刷新</button>
+    </div>
+    <pre id="uploadOut" style="display:none"></pre>
+  </div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const api = async (url, opts) => {
+  const r = await fetch(url, opts);
+  return r.json();
+};
+
+function bar(v) {
+  const pct = v === null || v === undefined ? 0 : Math.round(v * 100);
+  return `<span class="bar"><i style="width:${pct}%"></i></span> <span class="sub">${v === null || v === undefined ? "—" : v.toFixed(2)}</span>`;
+}
+
+async function loadGraph() {
+  const d = await api("/api/graph");
+  $("#summary").innerHTML =
+    `知识点 <b>${d.points.length}</b> 个 ｜ 真题 <b>${d.problems.length}</b> 道 ｜ 资料 <b>${d.resources.length}</b> 份`;
+
+  $("#warnBox").innerHTML = d.cycles.length
+    ? `<div class="card"><h2>⚠ 前置边环（已打破环 + 告警，见 README §3.5）</h2><div class="warn">` +
+      d.cycles.map((r) => r.join(" → ")).join("<br>") + `</div></div>`
+    : "";
+
+  const rows = d.points
+    .slice()
+    .sort((a, b) => b.mention - a.mention)
+    .map((p) => `<tr>
+      <td>${p.name}</td>
+      <td>${bar(p.mastery)}</td>
+      <td>${p.mention}</td>
+      <td>${p.resources.map((r) => r.split("/").pop()).map((r) => `<span class="tag">${r}</span>`).join("")}</td>
+      <td>${p.prev.map((x) => `<span class="tag">← ${x}</span>`).join("") || '<span class="sub">无前置</span>'}</td>
+    </tr>`).join("");
+  $("#graph").innerHTML = `<table><thead><tr><th>知识点</th><th>掌握度</th><th>考频</th><th>资料</th><th>前置</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+  $("#rank").innerHTML = d.points.slice().sort((a, b) => b.mention - a.mention).slice(0, 10)
+    .map((p, i) => `${i + 1}. ${p.name} <span class="sub">· ${p.mention} 次</span>`).join("<br>");
+
+  const f = await api("/api/files");
+  $("#files").innerHTML =
+    `<b>资料</b>（${f.materials.length}）<br>` + f.materials.map((x) => `<span class="tag">${x.split("/").pop()}</span>`).join("") +
+    `<br><br><b>真题</b>（${f.problems.length}）<br>` + f.problems.map((x) => `<span class="tag">${x.split("/").pop()}</span>`).join("");
+}
+
+$("#uploadBtn").onclick = async () => {
+  const body = { name: $("#fname").value, content: $("#fcontent").value, target: $("#target").value };
+  const out = await api("/api/upload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const el = $("#uploadOut");
+  el.style.display = "block";
+  el.textContent = JSON.stringify(out, null, 2);
+  loadGraph();
+};
+$("#reloadBtn").onclick = loadGraph;
+loadGraph();
+</script>
+</body>
+</html>

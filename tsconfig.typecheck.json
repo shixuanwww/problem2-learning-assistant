@@ -1,0 +1,30 @@
+// ============================================================================
+// tsconfig.typecheck.json — **仅供开发期静态自检**，不参与运行 / 演示 / 测试。
+//
+// 为什么需要它：
+//   本项目运行时用 `node --experimental-strip-types`，它**只做类型擦除、不做类型检查**
+//   ⇒ 接口不匹配（例如"类没实现它 implements 的接口")可以一路裸奔到运行时才炸。
+//   2026-10-11 的审核就抓到过一处：SimNet 没实现 SimulationNetwork.ask。
+//
+// 用法（需要 devDependencies 里的 typescript + @types/node，即先 `npm install`）：
+//     npm run typecheck
+// ⇒ 仅开发期使用；**运行时依赖仍然是零**（`dependencies` 字段为空）。
+// ============================================================================
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/**/*.ts", "demo/**/*.ts", "tests/**/*.ts"]
+}

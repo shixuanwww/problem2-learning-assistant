@@ -10,8 +10,10 @@ import { makeNet } from "./helpers.ts";
 test("用例16：ask 一个资料不足的问题 → answer=null + sufficient=false + history 新增 Ask 记录", async () => {
   const net = makeNet();
   const before = net.history.filter((h) => h.kind === "Ask").length;
-  const qa = new QaEngine([{ resource: "m.md", locator: "§1", text: "整数加减法是四则运算的基础。" }]);
-  const res = await qa.ask("什么是酸碱中和反应", net);
+  const qa = new QaEngine([{ resource: "m.md", locator: "§1", text: "整数加减法是四则运算的基础。" }], net, {
+    offline: true,
+  });
+  const res = await qa.ask("什么是酸碱中和反应");
   assert.equal(res.sufficient, false);
   assert.equal(res.answer, null);
   const after = net.history.filter((h) => h.kind === "Ask").length;
@@ -21,8 +23,12 @@ test("用例16：ask 一个资料不足的问题 → answer=null + sufficient=fa
 test("用例16b：ask 资料充足 → answer 非空且也回填 Ask 记录", async () => {
   const net = makeNet();
   const before = net.history.filter((h) => h.kind === "Ask").length;
-  const qa = new QaEngine([{ resource: "m.md", locator: "§1", text: "整数加减法是四则运算的基础，加法逢十进一。" }]);
-  const res = await qa.ask("整数加减法是什么", net);
+  const qa = new QaEngine(
+    [{ resource: "m.md", locator: "§1", text: "整数加减法是四则运算的基础，加法逢十进一。" }],
+    net,
+    { offline: true },
+  );
+  const res = await qa.ask("整数加减法是什么");
   assert.equal(res.sufficient, true);
   assert.ok(res.answer && res.answer.length > 0);
   assert.ok(res.citations.length >= 1);

@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { SimNet } from "../src/network.ts";
 import { wireActions } from "../src/plan.ts";
-import type { AliasTable } from "../src/normalize.ts";
 import type { AnalyzeProReq, AnalyzeResReq, Edge, Problem } from "../src/types.ts";
 
 export function makeTempDir(): string {

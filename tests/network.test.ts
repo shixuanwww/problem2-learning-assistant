@@ -83,13 +83,13 @@ test("用例6：继续上传新资料，体系更新且原顺序仍合法", () =
 test("用例7/8：带引用问答 + 资料不足拒绝", async () => {
   const net = makeNet();
   const text = "整数加减法是四则运算的基础。加法逢十进一，减法借一当十。";
-  const qa = new QaEngine([{ resource: "m.md", locator: "§1", text }]);
-  const ok = await qa.ask("整数加减法是什么", net);
+  const qa = new QaEngine([{ resource: "m.md", locator: "§1", text }], net, { offline: true });
+  const ok = await qa.ask("整数加减法是什么");
   assert.equal(ok.sufficient, true);
   assert.ok(ok.answer && ok.answer.length > 0);
   assert.ok(ok.citations.length >= 1);
 
-  const absent = await qa.ask("二次根式怎么化简", net);
+  const absent = await qa.ask("二次根式怎么化简");
   assert.equal(absent.sufficient, false);
   assert.equal(absent.answer, null);
 });
