@@ -15,7 +15,7 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { SimNet } from "../src/network.ts";
-import { wireActions, proposePlan } from "../src/plan.ts";
+import { wireActions, proposePlan, proposePlanFromModel } from "../src/plan.ts";
 import { loadAliases } from "../src/normalize.ts";
 import { collectMdFiles, parseMaterialRelations, parseProblemRelations, readText } from "../src/analyze/parse.ts";
 import { analyzeResource } from "../src/analyze/analyze.ts";
@@ -88,6 +88,12 @@ async function main() {
     net.integrate({ kind: "ProReq", data: { problem: prob, points: prob.points } });
   }
   console.log(`  接入 ${problemFiles.length} 道真题；考频前三：${net.pointRank(3).map((p) => p.name).join("、")}`);
+  const cands = net.mergeCandidates();
+  console.log(
+    `  合并候选（同义写法，只提示、不自动合并；确认后写进 data/aliases.json）：${
+      cands.length ? cands.slice(0, 5).map((c) => `${c.from.name}→${c.into.name}(${c.similarity.toFixed(2)})`).join("、") : "无"
+    }`,
+  );
   const rings = net.cycles();
   if (rings.length) {
     console.log(
@@ -200,6 +206,21 @@ async function main() {
   console.log(`  第 3 轮后的计划：\n${fmtPlan(net)}`);
 
   // ---------- 补充演示（§4.13）：模型提议被拒 → 回落规则版计划 ----------
+  line("补充演示：让真模型提一版计划 → 校验 → 通过则采用 / 拒绝则回落（§4.13）");
+  if (hasChatKey()) {
+    const m = await proposePlanFromModel(net);
+    console.log(`  ⇒ by=${m.by}｜accepted=${m.accepted}`);
+    for (const r of m.rejected ?? []) console.log(`     拒绝理由：${r}`);
+    if (m.accepted) {
+      console.log(`  ⇒ 采用模型提议的计划（覆盖 ${m.plan?.length ?? 0} 个知识点）：`);
+      console.log(fmtPlan(net, m.plan ?? []));
+    } else {
+      console.log(`  ⇒ 回落到 §4.7 规则版计划（仍可用、且满足拓扑序）：\n${fmtPlan(net)}`);
+    }
+  } else {
+    console.log("  （本机没有 chat Key ⇒ 跳过真模型提议；下面用一条手写的非法草稿演示拒绝 + 回落）");
+  }
+
   line("补充演示：模型提议被拒 → 回落规则版计划（§4.13 / §8 用例 10·18）");
   const badDraft = [
     { pointName: pName, actions: [{ kind: "Do", problemName: "2024 期末 第9题（不存在的真题）" }] },

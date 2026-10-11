@@ -19,6 +19,7 @@ import {
   masteryOf,
 } from "./types.ts";
 import type { SimNet } from "./network.ts";
+import { chat } from "./analyze/llm.ts";
 
 /** 把 §4.7 的动作填充接入 SimNet.makePlan（setActionFiller）。 */
 export function wireActions(net: SimNet): void {
@@ -307,4 +308,133 @@ function validateTopoOrder(net: SimNet, plan: LearnPlan): string[] {
     }
   }
   return errs;
+}
+
+// ---------- 模型提议通道的"真接线"：让模型产出草稿，再走上面同一套校验 ----------
+//
+// 【2026-10-11 第三轮补】此前 `proposePlan` 的调用方只有测试、/api/propose 与 demo 里
+// **手写**的非法草稿 —— 也就是说题面 L3 1.2「让 AI 决定下一步学什么、怎么学」实际由规则完成，
+// 评审一问"AI 在哪决策"就会穿。这里补上真正的接线：模型出草稿 → proposePlan 校验 →
+// 通过则采用、拒绝则调用方回落规则版计划（决策日志两条路都留痕）。
+//
+// 模型只能提"知识点名 + 动作意图"，不能直接改 state，也不能编造资料/真题 —— 由 proposePlan 兜底。
+const PLAN_SYS =
+  "你是学习计划编排器。只能返回 JSON 对象，不要任何解释文字。\n" +
+  '格式：{"plan":[{"pointName":"知识点名","actions":[{"kind":"Read","resource":"资料路径"}|{"kind":"Explain"}|{"kind":"Do","problemName":"真题名"}]}]}\n' +
+  "硬性要求：\n" +
+  "1. plan 数组必须**逐一覆盖**清单里的每个知识点，个数与清单一致、每个**恰好一次**；\n" +
+  "2. 顺序**照抄清单顺序**（清单已按前置关系排好，不要重排）；\n" +
+  "3. Read 的 resource 只能取该知识点自己的资料；Do 的 problemName 只能取给出的真题名；\n" +
+  '4. 没把握就只写 {"kind":"Explain"} —— 严禁编造资料或真题。';
+
+export interface ModelPlanOptions {
+  /** 测试注入口：非 null 时直接把它当作模型输出（空串 = 模拟模型调用失败），不联网。 */
+  rawOutput?: string | null;
+  maxTokens?: number;
+}
+
+export interface ModelPlanProposalResult extends PlanProposalResult {
+  /** model = 真拿到了模型草稿（无论最终接受还是拒绝）；none = 没拿到可用草稿（调用方回落规则版）。 */
+  by: "model" | "none";
+  /** 原始模型输出的前 400 字（排查/回放用）。 */
+  raw?: string;
+}
+
+/** 给模型的上下文：按拓扑序列出"知识点 + 前置 + 资料 + 真题 + 当前掌握度"，尽量短。 */
+function buildPlanPrompt(net: SimNet): string {
+  const lines: string[] = [];
+  for (const p of net.topoOrder()) {
+    const pid = p.pid ?? -1;
+    const prevs = pid >= 0 ? net.graph[pid].prev.map((q) => q.name) : [];
+    const q = net.queryPoint({ name: p.name });
+    const mastery = net.state.get(net.keyOf(p.name));
+    lines.push(
+      `- ${p.name}｜掌握度：${mastery === undefined ? "未学过(先验0.5)" : mastery.toFixed(2)}` +
+        `｜前置：${prevs.length ? prevs.join("、") : "无"}` +
+        `｜资料：${q.resources.length ? q.resources.join("、") : "无"}` +
+        `｜真题：${q.problems.length ? q.problems.map((x) => x.name).join("、") : "无"}`,
+    );
+  }
+  return `知识点清单（按前置顺序）：\n${lines.join("\n")}\n\n请给出一份学习计划 JSON 数组。`;
+}
+
+function parseJSONLoose(s: string): unknown {
+  const t = s.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  try {
+    return JSON.parse(t);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 兼容模型常见的两种外壳：`{"plan":[...]}` 与直接给数组。
+ * 之所以要这层：chat() 走的是 `response_format: {type:"json_object"}`，
+ * 该模式的顶层**必须是对象**（OpenAI/DeepSeek 兼容接口的硬约束），
+ * 所以就算提示词写"返回数组"，模型也会把数组包一层 —— 实测就是这样被拒的
+ * （拒绝理由"草稿必须是数组"看着像模型乱来，其实是接口约束，得在系统侧剥壳）。
+ */
+function unwrapDraft(parsed: unknown): unknown {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as Record<string, unknown>;
+    for (const key of ["plan", "draft", "items", "learnPlan", "plans"]) {
+      if (Array.isArray(obj[key])) return obj[key];
+    }
+    const arrays = Object.values(obj).filter(Array.isArray);
+    if (arrays.length === 1) return arrays[0];
+  }
+  return parsed;
+}
+
+function shortReasonOf(e: unknown): string {
+  return String(e).split("\n")[0].replace(/\s+/g, " ").slice(0, 120);
+}
+
+/**
+ * 让**真模型**提一份计划草稿，再走 `proposePlan` 的同一套校验。
+ *
+ * 三种出口（都不抛异常、调用方永远能回落 `net.makePlan()`）：
+ *   ① 模型调用失败/空输出 ⇒ rejected + 决策日志，by="none"；
+ *   ② 输出不是合法 JSON   ⇒ rejected + 决策日志，by="none"；
+ *   ③ 拿到草稿 ⇒ 交给 proposePlan 校验（可能 accepted，也可能 rejected），by="model"。
+ */
+export async function proposePlanFromModel(
+  net: SimNet,
+  opts: ModelPlanOptions = {},
+): Promise<ModelPlanProposalResult> {
+  let raw = "";
+  try {
+    raw =
+      opts.rawOutput != null
+        ? opts.rawOutput
+        : await chat(
+            [
+              { role: "system", content: PLAN_SYS },
+              { role: "user", content: buildPlanPrompt(net) },
+            ],
+            { json: true, maxTokens: opts.maxTokens ?? 1200 },
+          );
+    if (!raw.trim()) throw new Error("模型返回空内容");
+  } catch (e) {
+    const reason = `模型提议失败：${shortReasonOf(e)}`;
+    net.logDecision({ at: new Date().toISOString(), action: "proposePlan.reject", reasons: [reason], draft: null });
+    return { accepted: false, rejected: [reason], by: "none" };
+  }
+
+  const draft = parseJSONLoose(raw);
+  if (draft === null) {
+    const reason = "模型输出不是合法 JSON（已拒绝，未执行）";
+    net.logDecision({
+      at: new Date().toISOString(),
+      action: "proposePlan.reject",
+      reasons: [reason],
+      draft: { raw: raw.slice(0, 400) },
+    });
+    return { accepted: false, rejected: [reason], by: "none", raw: raw.slice(0, 400) };
+  }
+
+  // 剥掉 {"plan": [...]} 外壳后再校验；剩下的校验（覆盖完整/恰好一次/拓扑/资源与真题存在性）全在 proposePlan 里
+  const res = proposePlan(net, unwrapDraft(draft));
+  return { ...res, by: "model", raw: raw.slice(0, 400) };
 }

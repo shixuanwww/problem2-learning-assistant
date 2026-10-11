@@ -37,6 +37,14 @@ export interface PointNode {
   prev: Point[]; // 前置知识点（指向本知识点的边的起点；每个都带 pid）
   resources: Resource[]; // 哪些资料涉及本知识点
   dead?: boolean; // 被 mergePoints 合并掉的失效点（§4.5）；保留下标，避免其余 pid 位移
+  /**
+   * 【2026-10-11 第三轮修 bug】被合并到的目标 pid。
+   * 以前 mergePoints 只把旧名从 nameToPid 删掉 —— 重启读回 graph.json 时
+   * loadGraph 会把 dead 点的名字重新注册，于是"合并 → 重启 → 再用旧名上传资料"
+   * 会命中 dead 点，资料被挂到查不到的节点上（静默丢数据）。
+   * 现在保留旧名 → dead pid 的映射，由 redirect() 沿 mergedInto 落到合并目标。
+   */
+  mergedInto?: number;
 }
 export type PointGraph = PointNode[]; // 下标即 pid
 // 点族：graph[i].name + pid = i 即均成完整 Point
@@ -112,6 +120,19 @@ export const TOP_K = 5; // 检索 top-k
 export const CHUNK_SIZE = 3000; // 长文切分粒度（字）
 export const VEC_SUFFICIENT_THRESHOLD = 0.45; // 向量模式：top1 相似度 >= 0.45 视为充足
 export const KEYWORD_COVERAGE_THRESHOLD = 0.5; // 关键词模式：词项覆盖率 >= 0.5
+/**
+ * 【2026-10-11 第三轮】关键词模式 + **抽取式回答**（没有模型再把关）时的加固开关：
+ * 要求 top1 片段必须命中"话题锚点"（提问里第一个实词段的头两个汉字）。
+ *
+ * 为什么需要：只按"并集覆盖率 ≥ 0.5"算，会出现"一半词项命中 A 片段、另一半命中 B 片段"
+ * 被拼成"资料充足"。实测：资料只讲「小数的认识 / 小数加减」，问「小数乘除法怎么计算」
+ * 却判 sufficient=true，答案是一段**整数乘除法**的原文（话题"小数乘除"整体不在资料里，
+ * 只是"小数"和"乘除"分别命中了两份不同的资料）——与题面 §2.4 1.2 冲突。
+ * 有 Key（模型会把关、且只能把 sufficient 降级）时不启用，避免把"证据分散但确实能回答"的问题误拒。
+ */
+export const KEYWORD_REQUIRE_TOPIC_ANCHOR = true;
+/** 合并候选（只提示、不自动合并）的字符二元组 Jaccard 阈值。 */
+export const MERGE_CANDIDATE_JACCARD = 0.6;
 export const UNCLASSIFIED_KIND = "未分类"; // 题型缺失的默认值
 export const KEEP_RECENT = 500; // §11：answers.json / history.json / decisions.json 只保留最近 500 条
 export const CONTEXT_ANSWERS = 5; // §11：上下文包注入该点的 AnswerRecord 最近 N=5 条

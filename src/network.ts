@@ -29,6 +29,7 @@ import {
   KEEP_RECENT,
   MASTERY_DELTA,
   MASTERY_THRESHOLD,
+  MERGE_CANDIDATE_JACCARD,
   UNCLASSIFIED_KIND,
   clamp01,
   masteryOf,
@@ -126,7 +127,27 @@ export class SimNet implements SimulationNetwork {
 
   private findPid(name: string): number {
     const pid = this.nameToPid.get(this.lookupKey(name));
-    return pid === undefined ? -1 : pid;
+    return pid === undefined ? -1 : this.redirect(pid);
+  }
+
+  /**
+   * 【2026-10-11 第三轮修 bug】沿 mergedInto 链把 pid 落到"当前存活的点"。
+   *
+   * 背景：mergePoints 之后旧名的映射以前被直接删掉，重启读回 graph.json 时
+   * loadGraph 又会为 dead 点重新注册名字 ⇒ "合并 → 重启 → 再用旧名上传资料"会命中 dead 点，
+   * 资料被挂到查不到的节点上（体系里看不到、计划里也没有）。实测复现。
+   * 现在旧名保留映射，统一在这里重定向到合并目标：新资料照旧归到合并后的点上。
+   */
+  private redirect(pid: number): number {
+    let cur = pid;
+    const seen = new Set<number>();
+    while (cur >= 0 && cur < this.graph.length && this.graph[cur].dead) {
+      const next = this.graph[cur].mergedInto;
+      if (next === undefined || next < 0 || next >= this.graph.length || seen.has(cur)) break;
+      seen.add(cur);
+      cur = next;
+    }
+    return cur;
   }
 
   private pointByPid(pid: number): Point {
@@ -160,7 +181,8 @@ export class SimNet implements SimulationNetwork {
   private ensurePoint(rawName: string, warnVariant = true): number {
     const key = this.lookupKey(rawName);
     const existing = this.nameToPid.get(key);
-    if (existing !== undefined) return existing;
+    // 已存在（含"被合并掉的旧名"）⇒ 一律落到存活的点，不新建（幂等）
+    if (existing !== undefined) return this.redirect(existing);
 
     const pid = this.graph.length;
     this.graph.push({ name: rawName, prev: [], resources: [], dead: false });
@@ -229,16 +251,27 @@ export class SimNet implements SimulationNetwork {
     for (const p of data.points) this.ensurePoint(p.name, false);
 
     const idx = this.problems.findIndex((x) => x.name === problem.name);
-    const isNew = idx === -1;
-    if (isNew) this.problems.push(problem);
-    else this.problems[idx] = problem;
 
-    // 考频只在"这道题首次入库"时 +1（§4.1 幂等要求）
-    if (isNew) {
-      for (const p of problem.points) {
+    // 已入库过 ⇒ 先扣掉旧考题的计数，再统一加上新考题的计数。
+    // 【2026-10-11 第三轮修 bug】以前只在"首次入库"时 +1，重复入库直接替换 problems[idx]，
+    // 于是考频与实际题目集脱节：实测把同一道题从「整数加减」改成「整数乘除」后，
+    // pointMention 仍是 [1,0]，pointRank 把没有任何真题覆盖的点排到了第一。
+    // 网页壳重传同名真题、或重启时用模型重新抽题（模型输出不稳定）都会触发。
+    if (idx !== -1) {
+      for (const p of this.problems[idx].points) {
         const pid = this.findPid(p.name);
-        if (pid >= 0) this.pointMention[pid] += 1;
+        if (pid >= 0) this.pointMention[pid] = Math.max(0, this.pointMention[pid] - 1);
       }
+      this.problems[idx] = problem;
+    } else {
+      this.problems.push(problem);
+    }
+
+    // 无论首次入库还是重入库，考频都按"当前题目集"重新记一次（幂等：重入库同一考点集合
+    // 先 -1 再 +1，净变化为 0，不会把考频刷高）。
+    for (const p of problem.points) {
+      const pid = this.findPid(p.name);
+      if (pid >= 0) this.pointMention[pid] += 1;
     }
   }
 
@@ -416,11 +449,12 @@ export class SimNet implements SimulationNetwork {
 
   // ---------- §4.4 queryPoint ----------
   queryPoint(point: Point): { resources: Resource[]; problems: Problem[]; kinds: string[] } {
-    const key = this.lookupKey(point.name);
-    const pid = this.nameToPid.get(key);
-    if (pid === undefined || this.graph[pid].dead) {
+    // 走 findPid（含 mergedInto 重定向）：合并掉的旧名也能查到合并目标上的资料与真题
+    const pid = this.findPid(point.name);
+    if (pid < 0 || this.graph[pid].dead) {
       return { resources: [], problems: [], kinds: [] };
     }
+    const key = this.lookupKey(this.graph[pid].name);
     const resources = [...this.graph[pid].resources];
     // 真题匹配：problems[].points[].name 也先归一化再比（§4.4 口径）
     const matched = this.problems.filter((prob) =>
@@ -500,9 +534,12 @@ export class SimNet implements SimulationNetwork {
       a.pointNames = a.pointNames.map((n) => (n === fromKey ? intoKey : n));
     }
 
-    // 标记 from 失效（保留下标），并把 from 从 nameToPid 移除
+    // 标记 from 失效（保留下标），但**保留**它的名字映射，改成重定向到合并目标：
+    // 这样"合并 → 重启 → 再用旧名上传资料"会把新资料归到 into 上，而不是丢在一个查不到的 dead 点上
+    // （2026-10-11 第三轮修；以前这里是 nameToPid.delete(fromKey)，重启后旧名会复活成 dead 点）。
     fromNode.dead = true;
-    this.nameToPid.delete(fromKey);
+    fromNode.mergedInto = intoPid;
+    this.nameToPid.set(fromKey, fromPid);
 
     // 【2026-10-11 修正】早期用 kind:"Ask" 记这条，会污染 §8 用例 16 的 Ask 计数。
     // 合并知识点会改写掌握度（属"决策"而非"学习行为"）⇒ 用专用 kind "Merge"。
@@ -553,7 +590,9 @@ export class SimNet implements SimulationNetwork {
     if (learn.kind === "Do") {
       const { problem, status } = learn;
       const delta = MASTERY_DELTA[status];
-      const pointKeys = problem.points.map((p) => this.lookupKey(p.name));
+      // 走 stateKeyOf：若题目写的是"已被合并掉的旧名"，掌握度要记到合并目标上，
+      // 否则会在 state 里留下一个图里查不到的孤儿 key（2026-10-11 第三轮修）。
+      const pointKeys = problem.points.map((p) => this.stateKeyOf(p.name));
 
       // 一致性检查：题目提到的知识点若不在图中（既无资料也未被任何真题引入过），
       // 说明这条 record 来自体系之外。仍然记状态（学习确实发生了），但明确告警，
@@ -626,6 +665,8 @@ export class SimNet implements SimulationNetwork {
       resources: n.resources,
       prevPids: n.prev.map((q) => q.pid).filter((p): p is number => p !== undefined),
       dead: n.dead ?? false,
+      // dead 点的合并目标：不落盘的话，重启后旧名就找不到"该并到哪去"（§4.5 / 2026-10-11 第三轮）
+      mergedInto: n.mergedInto ?? null,
     }));
     const problems = this.problems.map((p) => ({
       name: p.name,
@@ -655,7 +696,13 @@ export class SimNet implements SimulationNetwork {
     const g = raw as {
       version?: number;
       resources?: string[];
-      points?: Array<{ name: string; resources?: string[]; prevPids?: number[]; dead?: boolean }>;
+      points?: Array<{
+        name: string;
+        resources?: string[];
+        prevPids?: number[];
+        dead?: boolean;
+        mergedInto?: number | null;
+      }>;
       problems?: Array<{ name: string; content: string; kind?: string; pointPids?: number[] }>;
       pointMention?: number[];
     };
@@ -680,6 +727,11 @@ export class SimNet implements SimulationNetwork {
       prev: (p.prevPids ?? []).map((x) => ({ name: points[x].name, pid: x })),
       resources: p.resources ?? [],
       dead: p.dead ?? false,
+      // 只接受合法的合并目标下标；非法值当没写过（宁可不重定向，也不指向越界 pid）
+      mergedInto:
+        typeof p.mergedInto === "number" && Number.isInteger(p.mergedInto) && p.mergedInto >= 0 && p.mergedInto < maxIdx
+          ? p.mergedInto
+          : undefined,
     }));
     this.pointMention = pointMention.map((n) => n);
     this.problems = (g.problems ?? []).map((p) => ({
@@ -688,9 +740,14 @@ export class SimNet implements SimulationNetwork {
       kind: p.kind ?? UNCLASSIFIED_KIND,
       points: (p.pointPids ?? []).map((x) => ({ name: points[x].name, pid: x })),
     }));
+    // 重建索引：**dead 点也注册**（配合 redirect 让旧名落到合并目标上）；
+    // 同一个 key 撞车时优先保留存活点的下标，避免被 dead 点抢占。
     this.nameToPid = new Map();
     for (let i = 0; i < this.graph.length; i++) {
-      this.nameToPid.set(this.lookupKey(this.graph[i].name), i);
+      const key = this.lookupKey(this.graph[i].name);
+      const exists = this.nameToPid.get(key);
+      if (exists !== undefined && !this.graph[exists].dead) continue;
+      this.nameToPid.set(key, i);
     }
   }
 
@@ -699,6 +756,68 @@ export class SimNet implements SimulationNetwork {
   keyOf(name: string): string {
     return this.lookupKey(name);
   }
+  /**
+   * **状态键**：把名字解析到图中当前存活的点，再取该点的 key。
+   * 用于 state / AnswerRecord 的读写 —— 合并之后，旧名与合并目标共用一个状态键
+   * （不能直接用 keyOf，否则"用旧名做了一道题"会在 state 里写出一个孤立的 key）。
+   */
+  stateKeyOf(name: string): string {
+    const pid = this.findPid(name);
+    return pid >= 0 ? this.lookupKey(this.graph[pid].name) : this.lookupKey(name);
+  }
+
+  /**
+   * **合并候选**（只提示、不自动合并）。
+   *
+   * 题面 §2.4 1.1 要求"尽量把名字不同但本质相同的知识点合并"。本项目坚持**不自动合并**
+   * （自动合并会静默吃掉一个点、不可逆），但也不该只靠人肉盯 graph.json —— 所以给一份候选清单：
+   * 名字的**字符二元组 Jaccard 相似度** ≥ MERGE_CANDIDATE_JACCARD 的成对知识点。
+   *
+   * 为什么用二元组 Jaccard 而不是"包含关系"：`分数` / `分数加减` 是**整体-部分**关系，
+   * 不是同义点（Jaccard 0.33 会被排除）；而 `小数加减法` / `小数加减`、`整数乘除法` / `整数乘除`
+   * 是明显的同义写法（Jaccard 0.75，会被列出）。人工确认后再写进 data/aliases.json 落库。
+   */
+  mergeCandidates(threshold = MERGE_CANDIDATE_JACCARD): Array<{ from: Point; into: Point; similarity: number }> {
+    const alive = this.alivePids();
+    const grams = (s: string): Set<string> => {
+      const set = new Set<string>();
+      for (let i = 0; i + 2 <= s.length; i++) set.add(s.slice(i, i + 2));
+      return set;
+    };
+    const out: Array<{ from: Point; into: Point; similarity: number }> = [];
+    for (let i = 0; i < alive.length; i++) {
+      for (let j = i + 1; j < alive.length; j++) {
+        const a = alive[i];
+        const b = alive[j];
+        const ka = this.lookupKey(this.graph[a].name);
+        const kb = this.lookupKey(this.graph[b].name);
+        if (ka === kb) continue;
+        const ga = grams(ka);
+        const gb = grams(kb);
+        if (ga.size === 0 || gb.size === 0) continue;
+        let inter = 0;
+        for (const g of ga) if (gb.has(g)) inter++;
+        const sim = inter / (ga.size + gb.size - inter);
+        if (sim < threshold) continue;
+        // into = 考频更高者（更可能是"主干知识点"）；平手时取名字更长的那个
+        const aFirst =
+          this.pointMention[a] !== this.pointMention[b]
+            ? this.pointMention[a] > this.pointMention[b]
+            : this.graph[a].name.length >= this.graph[b].name.length;
+        const from = aFirst ? b : a;
+        const into = aFirst ? a : b;
+        out.push({ from: this.pointByPid(from), into: this.pointByPid(into), similarity: sim });
+      }
+    }
+    out.sort((x, y) => {
+      if (y.similarity !== x.similarity) return y.similarity - x.similarity;
+      const kx = this.lookupKey(x.from.name);
+      const ky = this.lookupKey(y.from.name);
+      return kx < ky ? -1 : kx > ky ? 1 : 0;
+    });
+    return out.slice(0, 20);
+  }
+
   /** 取某知识点已答错/糊涂过的真题名（§4.7 规则 2 的回炉题依据）。 */
   reviewProblemNames(point: Point): string[] {
     const key = this.lookupKey(point.name);

@@ -112,6 +112,12 @@ async function main() {
 
   const planBefore = net.makePlan();
   console.log(`  学习计划（现在）：\n${fmtPlan(net, planBefore)}`);
+  const cands = net.mergeCandidates();
+  console.log(
+    `  合并候选（同义写法，只提示、不自动合并，确认后写进 data/aliases.json）：${
+      cands.length ? cands.map((c) => `${c.from.name}→${c.into.name}`).join("、") : "无（本课程的同义写法已被 aliases.json 合并）"
+    }`,
+  );
 
   // ---------- 第 3 步：基于资料问答（带来源 + 资料不足拒绝） ----------
   line("第 3 步：基于资料进行带来源的问答");
@@ -235,7 +241,8 @@ async function main() {
   const weakCount = net.reviewProblemNames({ name: targetPoint }).length;
   console.log(
     `  ✓ 作答「${target.name}」→ 错误（incorrect −0.25）：知识点掌握度 ${mBefore3.toFixed(2)} → ${mAfter3.toFixed(2)}；` +
-      `位置：第 ${posBefore3} 位 → 第 ${posAfter3} 位（掉出"已掌握"，重新排到前面）`,
+      `位置：第 ${posBefore3} 位 → 第 ${posAfter3} 位（掉出"已掌握"、回到"未掌握"组；` +
+      `同组内按掌握度升序，它 0.75 仍高于同层其他点 ⇒ 本层内暂时还排在最后，再错一次才会前移）`,
   );
   console.log(
     `    该点的"答错/糊涂过"记录数：${weakCount} 条 ⇒ 判定为**稳定薄弱**（不是偶然做错），` +

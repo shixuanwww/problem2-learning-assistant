@@ -64,6 +64,19 @@
   </div>
 
   <div class="card">
+    <h2>让模型提议一版计划（走同一套校验）</h2>
+    <p class="sub">
+      模型只能提「知识点名 + 动作意图」，后端校验（覆盖完整 / 恰好一次 / 拓扑序 / 资料与真题必须存在）；
+      不合法就拒绝并记决策日志，前端看到的仍是规则版计划 —— 对应题面 L3「模型做出不合法操作时，后端不会直接执行」。
+    </p>
+    <div class="row">
+      <button id="propBtn">让模型提议（需配 Key）</button>
+      <button class="ghost" id="propBadBtn">喂一条非法草稿（离线也能看拒绝）</button>
+    </div>
+    <pre id="propOut" style="display:none"></pre>
+  </div>
+
+  <div class="card">
     <h2>状态快照</h2>
     <div id="snap" class="sub">加载中…</div>
   </div>
@@ -104,6 +117,31 @@ $("#recBtn").onclick = async () => {
   loadPlan();
 };
 $("#reloadBtn").onclick = loadPlan;
+$("#propBtn").onclick = async () => {
+  const out = await api("/api/propose", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ useModel: true }),
+  });
+  const el = $("#propOut");
+  el.style.display = "block";
+  el.textContent = JSON.stringify(out, null, 2);
+  loadPlan();
+};
+$("#propBadBtn").onclick = async () => {
+  // 故意非法：编造一个不存在的知识点 + 编造一道不存在的真题 ⇒ 必须整条被拒、回落规则版计划
+  const out = await api("/api/propose", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify([
+      { pointName: "不存在的知识点", actions: [{ kind: "Explain" }] },
+      { pointName: "整数加减", actions: [{ kind: "Do", problemName: "不存在的真题" }] },
+    ]),
+  });
+  const el = $("#propOut");
+  el.style.display = "block";
+  el.textContent = JSON.stringify(out, null, 2);
+};
 loadPlan();
 </script>
 </body>

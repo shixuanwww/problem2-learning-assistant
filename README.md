@@ -17,7 +17,7 @@ node --experimental-strip-types demo/l1-demo.ts      # 保底演示：零依赖�
 node --experimental-strip-types demo/full-demo.ts    # 完整演示：接模型抽取 + 模型问答
 ```
 
-可选（网页壳，8 条 API + 三个页面）：
+可选（网页壳，9 条 API + 三个页面）：
 
 ```bash
 node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8787
@@ -31,7 +31,7 @@ node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8
 其他命令：
 
 ```bash
-node --experimental-strip-types --test tests/*.test.ts   # 38 条验收用例（含网页壳端到端）
+node --experimental-strip-types --test tests/*.test.ts   # 44 条验收用例（含网页壳端到端）
 node --experimental-strip-types demo/verify-persist.ts   # 另起进程读回持久化数据
 npm install && npm run typecheck                         # 可选：开发期静态类型自检（见 §9）
 ```
@@ -109,7 +109,12 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 
 真题进来 = `analyzePro(题目) → AnalyzeProReq → integrate`：
 
-- 题目按 name 去重入 `problems`；**考频 `pointMention[pid]` 只在"该题首次入库"时 +1**（保证幂等，重复上传不会把考频刷高）。
+- 题目按 name 去重入 `problems`；**考频 `pointMention[pid]` 由"当前题目集"决定**：
+  首次入库 +1；**重入库先扣掉该题旧考点的计数、再加上新考点的计数**
+  ⇒ 既幂等（同一考点集合反复入库净变化为 0、不会把考频刷高），又不会与实际问题集脱节
+  （修前只在首次入库 +1，重入库改了考点后考频还停在旧值，`pointRank` 会把没题覆盖的点排到第一）。
+- **合并候选**：`mergeCandidates()` 按名字的字符二元组 Jaccard ≥ **0.6** 列出疑似同义点（只提示、
+  **不自动合并**），网页壳在 `/api/graph` 里一并返回；人工确认后写进 `data/aliases.json`。
 
 ### 3.3 计划如何生成（`makePlan`）
 
@@ -170,7 +175,16 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 
 **充足性判定（可复现的数值口径）**：
 - 向量模式：top1 相似度 **≥ 0.45**；
-- 关键词模式：命中片段数 **≥ 1** 且 **查询词项覆盖率 ≥ 0.5**（覆盖率 = 去停用词后的查询词项出现在命中片段里的比例）；
+- 关键词模式：命中片段数 **≥ 1** 且 **查询词项覆盖率 ≥ 0.5**
+  （词项 = 去停用虚字后的**中文二元组** + 英文/数字词；覆盖率 = 命中片段里出现过的词项比例）；
+- 关键词模式 + **抽取式回答**（没配 chat Key，没有模型再把关）再加一道**话题锚点**：
+  top1 片段必须命中"提问里第一个实词段的头两个汉字"。
+  ⚠️ 这一条是实测补的：只按并集覆盖率算，资料里只有「小数的认识 / 小数加减」时，
+  问「**小数乘除法**怎么计算」会因为"小数"命中一份资料、"乘除"命中另一份资料而被拼成 `sufficient=true`，
+  答案却是一段**整数乘除法**的原文 —— 与题面"资料不足就说明资料不足"冲突。
+  （有 Key 时不启用这条：模型自己会把 `sufficient` 降级，而且**只能降不能升**，没必要提前用启发式拒答。）
+- **章节标题也参与匹配**：正文里可能一次都没写标题里的词（m03 的正文没写过"认识"二字，标题却叫「1 小数的认识」），
+  所以匹配文本 = 章节标题（locator 最后一段） + 正文；
 - **模型最终确认**：模型回答里若出现"资料不足 / 信息不足 / 无法回答 / 文中未提及 / 不足以回答"之类自述，
   一律降为 `answer = null` + `sufficient = false`（**出处照旧返回**，便于人工复核）。
 
@@ -179,6 +193,29 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 **上下文包（L3 完成标志）**：除资料片段外，还**只读**注入三项（定值 N=5 / M=5）：
 ① 相关点的 `state` + 相关题型的 `kindState`；② 相关真题 + 该点的 `AnswerRecord`（最近 5 条）；
 ③ 相关 `HistoryEntry`（最近 5 条）。模型要改状态**只能走 `record`**。
+
+### 3.7 「让 AI 决定下一步学什么、怎么学」怎么落地（L3 §2.5-1.2）
+
+两层，缺一不可：
+
+1. **规则版计划（默认、永远可用）**：`makePlan` + `fillActions`（§3.3）—— 拓扑序是硬约束，
+   动作按"读资料 → 讲解 → 做题 / 回炉题 / 巩固题"填充，确定性、可复现、离线可跑。
+2. **模型提议通道（真接线，可开关）**：`proposePlanFromModel(net)` 把"知识点清单（拓扑序 + 前置 +
+   资料 + 真题 + 当前掌握度）"交给模型，让模型返回 `{"plan":[{"pointName","actions":[…]}]}`，
+   再走**同一套** `proposePlan` 校验：
+   - 覆盖完整（每个存活知识点**恰好一次**）、拓扑序（`from` 严格在 `to` 前）、
+     `Read` 的 resource 必须属于该点、`Do` 的 problemName 必须真实存在（**禁止编造真题**）；
+   - 通过 ⇒ 采用模型给的顺序与动作；不通过 ⇒ **不执行**，调用方回落规则版计划；
+   - 接受/拒绝**都写** `data/decisions.json`（含原始草稿），可回放。
+
+🔴 两道工程细节（都是实测踩出来的）：
+- 模型要的是"提建议"，**执行权在后端**：模型不能直接改 `state`，也不能凭空造资料/真题；
+- `response_format: json_object` 模式**顶层必须是对象** ⇒ 提示词写成 `{"plan":[…]}`，
+  系统侧再剥壳（`unwrapDraft`）。修前提示词要"直接返回数组"，模型只能把它包一层，
+  结果每次都被拒在"草稿必须是数组"上 —— 看着像模型乱来，其实是接口约束。
+
+网页壳 `POST /api/propose` 两种用法：直接 POST 草稿数组（校验它）、或
+`{"useModel":true}`（让真模型出草稿再校验）；`demo/full-demo.ts` 两个方向都演示。
 
 ---
 
@@ -281,8 +318,11 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 | POST | `/api/record` | `LearnRecord` → 更新并落盘，返回新 `state` / `kindState` |
 | POST | `/api/analyze` | `{file}` → 对 `data/` 里已有的文件触发 analyze → integrate |
 | POST | `/api/upload` | `{name, content, target}` → **真上传**：落盘 → 自动分析 |
+| POST | `/api/propose` | 直接 POST 草稿数组 → 校验/拒绝；或 `{"useModel":true}` → **真模型**出草稿后走同一套校验 |
 
 > 上传走 **JSON**（不做 `multipart/form-data`）：省的是表单解析，**不是上传功能本身**。
+> `file` 只允许 `data/` 目录内的路径（防任意路径读取）；上传文件名不允许含路径分隔符或 `..`，
+> 且按目录约定补后缀（真题一律 `*.prob.md`，否则文件列表与启动扫描都看不到它）。
 
 ---
 
@@ -294,7 +334,9 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 | 掌握度幅度 | correct **+0.15** / incorrect **−0.25** / confuse **−0.05**，裁剪到 [0,1]；`kindState` 同公式同幅度 |
 | "已掌握"阈值 | **0.8** |
 | Top-k 检索条数 | **5** |
-| 充足性阈值 | 向量 top1 **≥ 0.45**；关键词 命中 ≥ 1 且 覆盖率 **≥ 0.5** |
+| 充足性阈值 | 向量 top1 **≥ 0.45**；关键词 命中 ≥ 1 且 覆盖率 **≥ 0.5**（词项 = 中文**二元组** + 英文词） |
+| 抽取式回答加严 | 关键词模式 + 没配 chat Key（抽取式回答）⇒ top1 片段还必须命中**话题锚点**（`KEYWORD_REQUIRE_TOPIC_ANCHOR`） |
+| 合并候选阈值 | 名字的字符二元组 Jaccard **≥ 0.6**（只提示，不自动合并；`MERGE_CANDIDATE_JACCARD`） |
 | 上下文包注入 | AnswerRecord 最近 **N=5**、HistoryEntry 最近 **M=5** |
 | 长文切分粒度 | **> 3000 字**按标题 / 段落切分 |
 | 落盘保留策略 | `answers.json` / `history.json` / `decisions.json` 各保留最近 **500 条**（超出按 `at` 裁剪） |
@@ -312,19 +354,24 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 **已实现**
 - L1 知识网络（归一化 / 别名 / 拓扑排序 / 环检测 / 考频 / `queryPoint`）
 - L2 模型抽取（三级路径 + schema 校验 + 重试）、带出处的问答（向量 / 关键词双模式 + 数值充足性判定）
-- L3 学习状态（`state` + `kindState`）、计划动作填充、回炉题、模型提议校验/拒绝/回落 + 决策日志
+- L2 同义点合并：别名表（`data/aliases.json`）+ 归一化 + **合并候选提示**（`mergeCandidates`，只提示不自动合并）
+- L3 学习状态（`state` + `kindState`）、计划动作填充、回炉题、**真模型提议通道**
+  （`proposePlanFromModel` → 校验 → 采用/拒绝 → 回落）+ 决策日志
 - 持久化（`graph` / `state` / `answers` / `history` / `decisions`，原子写 + 500 条裁剪 + 载入校验）
-- 网页壳（8 条 API + 3 个页面，含真上传）
-- `§8` 验收用例 **38 条**（含 6 条网页壳端到端：子进程起真实 server + 真发 HTTP，覆盖"模型挂了如何如实回落"）
+- 合并后**旧名重定向**到合并目标（`mergedInto`）：重启后再用旧名上传资料/做题，仍归到合并目标上，不丢数据
+- 网页壳（9 条 API + 3 个页面，含真上传与模型提议）
+- `§8` 验收用例 **44 条**（含 6 条网页壳端到端：子进程起真实 server + 真发 HTTP，覆盖"模型挂了如何如实回落"）
 
 **未实现 / 已知限制**
-- **语义合并**（用 embedding 找同义知识点）默认**不做** —— 只做字符串归一 + 别名表。
-  真要做，也只产**候选对**供人工确认，**不自动合并**（自动合并会静默吃掉一个点，不可逆）。
+- **语义合并**（用 embedding 找同义知识点）默认**不做** —— 只做字符串归一 + 别名表 +
+  二元组 Jaccard 的**候选提示**（`mergeCandidates`）。**不自动合并**（自动合并会静默吃掉一个点、不可逆）；
+  所以"路 A 模型抽取"给出的近义写法（如 `分数表示整体的一部分`）仍需人工确认后才能进别名表。
 - **PDF / PPTX 不直接解析**（需先转 md）。
 - **不处理多进程并发写**（同一份 `data/` 被两个进程同时写，后写的覆盖先写的）。单机演示场景外不加锁。
 - **路 A 的粒度问题**：模型对资料抽取的知识点粒度，可能与真题 md 里声明的粒度不一致
   ⇒ 可能出现"真题提到、资料没覆盖"的点（这类点在计划里没有 Read 动作，只有 Explain + 做题）。
-- **`mergePoints` 有实现但未在 demo 中演示**（`data/aliases.json` 覆盖了常规同义合并场景）。
+- **`mergePoints` 在 demo 里不直接调用**（`data/aliases.json` + `mergeCandidates` 覆盖了常规场景），
+  但它有专门用例（用例 37：合并 → 重启 → 再用旧名接入资料必须归到合并目标，不丢数据）。
 - 真模型问答 / 抽取需要 Key；无 Key 走降级路径（见 §6）。
 
 ---

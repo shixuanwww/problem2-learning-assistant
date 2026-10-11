@@ -14,6 +14,7 @@ import {
   CONTEXT_ANSWERS,
   CONTEXT_HISTORY,
   KEYWORD_COVERAGE_THRESHOLD,
+  KEYWORD_REQUIRE_TOPIC_ANCHOR,
   TOP_K,
   UNCLASSIFIED_KIND,
   VEC_SUFFICIENT_THRESHOLD,
@@ -40,15 +41,40 @@ function queryTerms(q: string): string[] {
   for (const run of q.match(/[\u4e00-\u9fff]+/g) ?? []) {
     // 去停用虚字
     const r = [...run].filter((ch) => !STOP_CHARS.has(ch)).join("");
-    for (let len = Math.min(3, r.length); len >= 2; len--) {
-      for (let i = 0; i + len <= r.length; i++) terms.add(r.slice(i, i + len));
-    }
+    // 【2026-10-11 第三轮】中文只取**二元组**，不再掺 3 元组：
+    // 3 元组在语料里几乎不连续（例："分数加减" 与语料里的 "分数相加减"），
+    // 只会把覆盖率的分母撑大 —— 实测「分数加减怎么通分」被 3 元组拖到 0.44 而误判"资料不足"。
+    for (let i = 0; i + 2 <= r.length; i++) terms.add(r.slice(i, i + 2));
   }
   return [...terms];
 }
 
 function contains(haystack: string, terms: string[]): string[] {
   return terms.filter((t) => haystack.includes(t));
+}
+
+/**
+ * 提问的**话题锚点**：去掉停用虚字后，第一个实词段的头两个汉字。
+ * 中文提问通常"话题打头"（"小数乘除法怎么计算" / "整数加减法是什么"），
+ * 所以"最相关的那段里连提问的主语都没出现"就是一个很强的『资料没讲这个』信号。
+ */
+function topicAnchor(question: string): string {
+  const run = question.match(/[\u4e00-\u9fff]+/g)?.[0] ?? "";
+  const filtered = [...run].filter((ch) => !STOP_CHARS.has(ch)).join("");
+  return filtered.slice(0, 2);
+}
+
+/**
+ * 参与**关键词匹配**的文本 = 章节标题（locator 的最后一段） + 正文。
+ *
+ * 【2026-10-11 第三轮修】标题以前只存在 locator 里、不参与匹配，而正文里可能一次都不写这个词：
+ * m03 的小节标题是「1 小数的认识」，正文却是"小数由整数部分、小数点与小数部分组成…" ——
+ * 于是问「小数的认识是什么」反而被判"资料不足"（实测复现）。标题显然该算资料的一部分。
+ * 只取 locator 的最后一段（不取"三年级数学 / 小数"这种上位标题），避免上下位标题污染匹配。
+ */
+function matchText(c: SourceChunk): string {
+  const title = (c.locator.split("/").pop() ?? "").trim();
+  return title ? `${title}\n${c.text}` : c.text;
 }
 
 // ---------- 检索 ----------
@@ -150,7 +176,7 @@ export class QaEngine implements Asker {
   private keywordRetrieve(question: string, topK: number): ScoredChunk[] {
     const terms = queryTerms(question);
     const scored: ScoredChunk[] = this.chunks.map((c) => {
-      const hit = contains(c.text, terms);
+      const hit = contains(matchText(c), terms);
       return { chunk: c, score: hit.length, terms: hit };
     });
     scored.sort((a, b) => b.score - a.score);
@@ -175,16 +201,38 @@ export class QaEngine implements Asker {
     return top1 >= VEC_SUFFICIENT_THRESHOLD;
   }
 
-  // 关键词模式：命中片段数 >= 1 且 查询词项覆盖率 >= 0.5
-  private isSufficientKeyword(query: string, scored: ScoredChunk[]): boolean {
-    const terms = queryTerms(query);
+  /**
+   * 关键词模式充足性（§4.10 + 2026-10-11 第三轮加固）：
+   *   ① 命中片段数 >= 1 且 **并集**词项覆盖率 >= 0.5（原口径，保证"至少得有东西"）；
+   *   ② `strict=true` 时再加一道**话题锚点**：top1 片段必须命中提问的话题锚点
+   *      （`KEYWORD_REQUIRE_TOPIC_ANCHOR`，见 types.ts 里的说明与实测反例）。
+   *
+   * 为什么要有 ②：只按并集算，会出现"一半词项命中 A 片段、另一半命中 B 片段"被拼成
+   * "资料充足"。实测（离线/无 Key，评审机最可能跑的路径）：资料里只有「小数的认识 / 小数加减」，
+   * 问「小数乘除法怎么计算」却返回 sufficient=true，答案是一段**整数乘除法**的原文 ——
+   * 与题面 §2.4 1.2「资料不足以支持答案时应提示资料不足」冲突。
+   *
+   * 为什么 ② 只在 `strict` 时启用（strict = 这次回答会是**抽取式**、没有模型再把关）：
+   * 有 Key 时模型本身就是最后一道闸门，而且它**只能把 sufficient 降级、不能升高**
+   * （见 ask 里的 isModelInsufficient）—— 那种情况下我宁可先把问题交给模型，
+   * 而不是用一条启发式规则把"证据散落在多处但确实能回答"的问题直接拒掉。
+   * 抽取式回答则没有这道闸门，所以必须要求"最相关的那段确实在讲你问的话题"。
+   */
+  private isSufficientKeyword(query: string, scored: ScoredChunk[], strict = false): boolean {
+    const terms = [...new Set(queryTerms(query))];
     if (terms.length === 0) return false;
     const hits = scored.filter((s) => s.score > 0);
     if (hits.length < 1) return false;
-    const present = new Set<string>();
-    for (const s of hits) for (const t of s.terms) present.add(t);
-    const coverage = present.size / terms.length;
-    return coverage >= KEYWORD_COVERAGE_THRESHOLD;
+    const union = new Set<string>();
+    for (const s of hits) for (const t of new Set(s.terms)) union.add(t);
+    const unionCoverage = union.size / terms.length;
+    if (unionCoverage < KEYWORD_COVERAGE_THRESHOLD) return false;
+    if (!strict) return true;
+    if (!KEYWORD_REQUIRE_TOPIC_ANCHOR) return true;
+    const anchor = topicAnchor(query);
+    if (!anchor) return true; // 提不出锚点（纯英文/符号）时不额外加严
+    // hits 已按 score 降序 ⇒ hits[0] 就是得分最高的片段
+    return matchText(hits[0].chunk).includes(anchor);
   }
 
   private toCitation(s: ScoredChunk): Citation {
@@ -259,11 +307,15 @@ export class QaEngine implements Asker {
     const net = this.net;
     const { scored, mode } = await this.retrieve(question);
 
+    // 这次回答会不会走模型（有 Key 或测试注入）。模型是最后一道闸门（只能降不能升），
+    // 所以"抽取式回答"时充足性判定要更严（要求证据集中在同一个片段里，见 isSufficientKeyword）。
+    const willUseModel = !this.offline && (hasChatKey() || this.answerOverride !== null);
+
     // 判定充足性
     const sufficient =
       mode === "vector"
         ? this.isSufficientVector(scored)
-        : this.isSufficientKeyword(question, scored);
+        : this.isSufficientKeyword(question, scored, !willUseModel);
 
     const citations = scored.map((s) => this.toCitation(s));
 
@@ -275,8 +327,7 @@ export class QaEngine implements Asker {
 
     // 有 Key 且充足 → 模型仅依据片段作答 + 注入只读上下文
     // （answerOverride 是测试注入口：注入时即使没配 Key 也走这条路径，见 QaOptions）
-    const tryModel = !this.offline && (hasChatKey() || this.answerOverride !== null);
-    if (tryModel) {
+    if (willUseModel) {
       try {
         const context = this.buildContext(question);
         const answer = await this.modelAnswer(question, scored, context);

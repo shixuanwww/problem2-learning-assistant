@@ -13,7 +13,7 @@ import http from "node:http";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { SimNet } from "./network.ts";
-import { proposePlan, wireActions } from "./plan.ts";
+import { proposePlan, proposePlanFromModel, wireActions } from "./plan.ts";
 import { QaEngine } from "./qa.ts";
 import { loadPreset } from "./analyze/analyze.ts";
 import { hasChatKey } from "./analyze/llm.ts";
@@ -243,9 +243,11 @@ function safeTargetName(name: unknown, target: "materials" | "problems"): string
   const base = String(name ?? "").trim();
   if (!base) throw new Error("缺少文件名");
   if (/[\\/]|\.\./.test(base)) throw new Error(`文件名非法（不允许路径分隔或 ..）：${base}`);
-  const suffix = target === "problems" ? ".prob.md" : ".md";
-  const finalName = base.endsWith(".md") ? base : base + suffix;
-  return finalName.replace(/\.prob\.prob\.md$/, ".prob.md");
+  // 【2026-10-11 第三轮修】按目录约定统一补后缀：真题目录只认 *.prob.md，
+  // 以前"上传时名字自带 .md"（如 x.md）会存成 x.md ⇒ /api/files 与启动扫描都看不到它。
+  const stem = base.replace(/\.prob\.md$/i, "").replace(/\.md$/i, "").trim();
+  if (!stem) throw new Error("缺少文件名");
+  return target === "problems" ? `${stem}.prob.md` : `${stem}.md`;
 }
 
 // ---------------------------------------------------------------- 路由
@@ -278,6 +280,12 @@ const server = http.createServer(async (req, res) => {
         state: stateToJSON(net.state),
         kindState: stateToJSON(net.kindState),
         cycles: net.cycles().map((ring) => ring.map((x) => x.name)),
+        // 合并候选（只提示、不自动合并）：人工确认后写进 data/aliases.json（见 README §3.2）
+        mergeCandidates: net.mergeCandidates().map((c) => ({
+          from: c.from.name,
+          into: c.into.name,
+          similarity: Number(c.similarity.toFixed(2)),
+        })),
         warnings: net.getWarnings(),
       });
     }
@@ -358,9 +366,15 @@ const server = http.createServer(async (req, res) => {
     // ---- POST /api/analyze（对 data/ 里已有文件触发 analyze → integrate） ----
     if (req.method === "POST" && p === "/api/analyze") {
       const body = (await readBody(req)) as { file?: string };
-      const file = String(body.file ?? "").trim();
+      const file = String(body.file ?? "").trim().replace(/\\/g, "/");
       if (!file) return sendJSON(res, 400, { error: "缺少 file" });
-      if (file.startsWith(`${DATA}/problems/`)) {
+      // 【2026-10-11 第三轮修】只允许分析与落盘目录内的文件：以前 file 可以是任意路径
+      // （无 Key 时只是报错，但有 Key 时会把该文件内容当"资料"发给模型）。
+      const dataRoot = DATA.replace(/\\/g, "/").replace(/\/+$/, "");
+      if (!file.startsWith(`${dataRoot}/`)) {
+        return sendJSON(res, 400, { error: `file 必须位于 ${dataRoot}/ 目录内（收到：${file}）` });
+      }
+      if (file.startsWith(`${dataRoot}/problems/`)) {
         const r = await ingestProblem(file);
         return sendJSON(res, 200, { ok: true, file, kind: "ProReq", extractedBy: r.by, points: r.points, note: r.note });
       }
@@ -398,8 +412,11 @@ const server = http.createServer(async (req, res) => {
 
     // ---- POST /api/propose（§4.13 模型提议通道的可视化：故意喂非法草稿看拒绝+回落） ----
     if (req.method === "POST" && p === "/api/propose") {
-      const draft = await readBody(req);
-      const result = proposePlan(net, draft);
+      const body = await readBody(req);
+      // 两种用法：① 直接 POST 草稿数组（校验它）；② POST {"useModel":true}（让真模型出草稿，再走同一套校验）。
+      const useModel =
+        !!body && typeof body === "object" && !Array.isArray(body) && (body as { useModel?: unknown }).useModel === true;
+      const result = useModel ? await proposePlanFromModel(net) : proposePlan(net, body);
       return sendJSON(res, 200, {
         ...result,
         // 回落：拒绝时调用方用规则版计划（这里直接把回落结果一并返回，便于前端展示"回落可见"）
