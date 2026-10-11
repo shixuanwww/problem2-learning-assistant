@@ -390,7 +390,7 @@ export interface SimulationNetwork extends LearningAssistant {
    - 优先选"该知识点答题结果为 `Incorrect` / `Confuse` 的真题"（**回炉**）；
    - 其次选考频高的知识点所对应的真题（**重点**）。
 3. **跳过已掌握**：若 `masteryOf(state, key) >= 阈值`（**0.8，定值见 §11**），**只留一道巩固题**。"排到后面"这件事**统一交给 §4.2 的排序键**，**不要在这里另排一遍**（两处排序会打架）。
-4. **前置不足**：若某前置点的 `masteryOf(state, prevKey)` 低于阈值，**只影响本点的动作取舍**（例如在本点动作序列最前补一个 `{kind:"Read"}` 指向该前置点的资料，或补一个 `{kind:"Explain"}` 提醒）。⚠️ **不要在这里尝试调整知识点顺序** —— 前置顺序已由拓扑序保证（§4.2），"前移"只能在同层内做。
+4. **前置不足**：若某前置点的 `masteryOf(state, prevKey)` 低于阈值，**只影响本点的动作取舍**（例如在本点动作序列最前补一个 `{kind:"Read"}` 指向该前置点的资料，或补一个 `{kind:"Explain"}` 提醒）。⚠️ **不要在这里尝试调整知识点顺序** —— 前置顺序已由拓扑序保证（§4.2），"前移"只能在同层内做。🔴 **已知待改（审计 2026-10-11）**：本条的 Read 与规则 1 的 Read 常指向**同一份资料**，会产生"读同一章节两遍"的冗余动作，**实现里还没去重**。
 5. 🔴 **选"回炉题"的依据**：规则 2 要的"该知识点答错过的真题"，从 `data/answers.json` 的 `AnswerRecord[]`（§3）里筛 —— `answers.filter(a => a.pointNames.includes(key) && a.status !== "correct").map(a => a.problemName)`。**不要靠解析 `HistoryEntry.detail` 这种人类可读文本**。
 
 ### 4.8 `record(learn)`（L3）
@@ -411,6 +411,14 @@ export interface SimulationNetwork extends LearningAssistant {
 - **格式保障**：优先用 **JSON Schema 校验**（不引入 ajv 的话，手写校验函数）；校验失败**重试一次**，再失败则**报错并跳过该文件**（不要写入脏数据）。
 - **切分**：> 3000 字按标题/段落切，逐块分析后**合并**（同一次分析的 points / edges 取并集）。
 - **必须区分资料与真题**（按 §7 目录规则）。
+
+> 🔴 **补注（2026-10-11 修 P0，实现期把两点定死了）**：
+> 1. **路径是四级、且顺序由调用方选**：`路 A 模型 → 路 B 声明 → presets 兜底 → 报错/如实 0 点`。
+>    - **网页壳的上传 / `/api/analyze` 用"模型优先"**（`preferModel`）：真课件转出来的 md **没有** `## 知识点:` 声明，只走规则就是"上传成功但静默 0 点"，L2 主路径等于没接线；
+>    - `l1-demo` 与启动接入用"声明优先"（不花 Token、离线稳定）；`full-demo` 用 `forceModel` 演兜底。
+> 2. 🔴 **`SimNet.analyzeRes()` 查 presets 必须用 `inputDir`（输入侧），不是 `dataDir`（产物侧）**：网页壳的 `dataDir` 是 `data/.runtime` ⇒ 修前它去读 `data/.runtime/presets/…`（永远不存在），**presets 兜底在网页里实际不可达**。响应/日志要带 `extractedBy: "model" | "preset" | "rule"`，一份都抽不出时给 `note` 说明原因。
+>
+> ⚠️ **presets 的键 = 资源名字符串**（与 `T2_DATA_DIR` 写法同形）：相对 `data` ⇒ 键写 `data/materials/x.md`；绝对路径 ⇒ 键写 `<绝对路径>/materials/x.md`（反斜杠已换成 `/`）。键不匹配时**静默不命中**，改目录口径时要一起改（§8 用例 21 就是钉这个的）。
 
 ### 4.10 问答（L2 1.2）
 
@@ -723,6 +731,10 @@ node --experimental-strip-types --test tests/*.test.ts
 | 18 | 模型提议里引用**不存在的真题 / 知识点** | **被拒**、记录拒绝原因、**回落规则版计划**（§4.13） |
 | 19 | 归一化撞车（`整数加减(一)` / `整数加减(二)`，别名表未配） | **保留两个独立点**并记 warning，**不得静默合并掉一个**（§4.5） |
 | 20 | 重启后再载入 `graph.json` | 知识点数 / 前置边 / 考频与重启前**完全一致**（§4.14，`verify-persist.ts` 一并校验） |
+| 21 | **网页壳**上传一份"**没有关系声明**的资料"（有 presets 预置） | 走 `presets` 兜底、`extractedBy="preset"`、`points>0`，落盘并进 `/api/graph`（修掉"上传成功但静默 0 点"，见 §4.11 补注） |
+| 22 | **网页壳**上传一份带 `## 涉及知识点:` 的真题 | `extractedBy="rule"`、点数与声明一致，且进体系可查 |
+| 23 | 上传既**无声明**、presets 也**没有**的资料 | 如实返回 `points=0` + 可诊断的 `note`（**不假装成功、不写脏数据**） |
+| 24 | `SimNet.analyzeRes()` 的预设兜底目录 | 读的是 **`inputDir`**（输入侧），不被 `dataDir`（产物侧）带偏 |
 
 ---
 

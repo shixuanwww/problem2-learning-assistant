@@ -31,7 +31,7 @@ node --experimental-strip-types src/server.ts        # 打开 http://127.0.0.1:8
 其他命令：
 
 ```bash
-node --experimental-strip-types --test tests/*.test.ts   # 20+ 条验收用例
+node --experimental-strip-types --test tests/*.test.ts   # 29 条验收用例（含网页壳端到端）
 node --experimental-strip-types demo/verify-persist.ts   # 另起进程读回持久化数据
 npm install && npm run typecheck                         # 可选：开发期静态类型自检（见 §9）
 ```
@@ -53,7 +53,7 @@ src/
     parse.ts          md 解析（标题切分 / 段落切分 / 路B 关系声明）
     schema.ts         手写 JSON 校验器（不引 ajv）
     llm.ts            模型调用（chat / embedding）+ 自带 .env 加载 + 无 Key 抛错
-    analyze.ts        资料 / 真题 → 结构化分析结果的三级流水线
+    analyze.ts        资料 / 真题 → 结构化分析结果的四级流水线（模型 → 声明 → presets → 如实失败）
   server.ts           网页壳（原生 node:http + 手写路由表）
 demo/
   l1-demo.ts          保底演示（离线，强制不走网络）
@@ -203,10 +203,24 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 23 + 45 = ?
 ```
 
-`analyze` 有**三级路径**，逐级回退：
-1. **路 B**：md 里有上面的显式声明 → 直接切出，**不调模型**（`l1-demo` 走这条，完全离线可跑）；
-2. **路 A**：没有声明 → 真调模型逐块抽取 + 手写 schema 校验（失败重试 1 次）；
-3. **兜底**：`data/presets/analyze-req.json` 里该文件的预置结果（**只在**前两级都拿不到时使用）。
+`analyze` 有**四级路径**，逐级回退（顺序由调用方选，见下）：
+
+1. **路 A（模型）**：真调模型逐块抽取 + 手写 schema 校验（失败重试 1 次）；
+2. **路 B（声明）**：md 里有上面的显式声明 → 直接切出，**不调模型**（`l1-demo` 走这条，完全离线可跑）；
+3. **兜底 presets**：`<输入目录>/presets/analyze-req.json` 里该文件的预置结果；
+4. 仍拿不到 ⇒ 抛错/返回 0 点，并由调用方如实标注（**不写脏数据、不假装成功**）。
+
+**谁来定顺序**（`analyzeResource({ forceModel, preferModel })`）：
+
+| 调用方 | 顺序 | 理由 |
+|---|---|---|
+| 网页壳上传 / `/api/analyze`（`preferModel: true`） | **路 A → 路 B → presets** | 真课件转出来的 md **没有**声明，必须让模型抽；这就是题面 L2 的主路径 |
+| `demo/full-demo.ts`（`forceModel: true`） | **路 A → presets** | 演示"模型不可用时的兜底" |
+| `demo/l1-demo.ts` / 启动接入（默认） | **路 B → presets** | 声明齐全的资料不花 Token，批量/离线稳定 |
+
+> 🔴 **没有 Key 时网页上传怎么办**：不会崩，也不会静默丢数据 —— 按上面的顺序回落到 presets / 声明，
+> 响应里带 `extractedBy: "model" | "preset" | "rule"` 与 `note`，日志逐份打印来源，
+> 一份都抽不出知识点时会 `console.warn` 提醒（**修掉了"上传成功但其实是 0 个知识点"的静默失败**）。
 
 **输入约定**：只吃 `.md`。PDF / PPTX **不直接解析**，请先转 md。
 
@@ -293,7 +307,7 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 - L3 学习状态（`state` + `kindState`）、计划动作填充、回炉题、模型提议校验/拒绝/回落 + 决策日志
 - 持久化（`graph` / `state` / `answers` / `history` / `decisions`，原子写 + 500 条裁剪 + 载入校验）
 - 网页壳（8 条 API + 3 个页面，含真上传）
-- `§8` 验收用例 20+ 条
+- `§8` 验收用例 **29 条**（含 4 条网页壳端到端：子进程起真实 server + 真发 HTTP）
 
 **未实现 / 已知限制**
 - **语义合并**（用 embedding 找同义知识点）默认**不做** —— 只做字符串归一 + 别名表。
