@@ -9,8 +9,15 @@
 //     关键词模式：命中片段数 >= 1 且 查询词项覆盖率 >= 0.5
 //   两条都不满足 ⇒ sufficient=false、answer=null（不得用模型自身知识补全）。
 // ============================================================================
-import type { AskResult, Citation, Resource } from "./types.ts";
-import { KEYWORD_COVERAGE_THRESHOLD, TOP_K, UNCLASSIFIED_KIND, VEC_SUFFICIENT_THRESHOLD } from "./types.ts";
+import type { Asker, AskResult, Citation } from "./types.ts";
+import {
+  CONTEXT_ANSWERS,
+  CONTEXT_HISTORY,
+  KEYWORD_COVERAGE_THRESHOLD,
+  TOP_K,
+  UNCLASSIFIED_KIND,
+  VEC_SUFFICIENT_THRESHOLD,
+} from "./types.ts";
 import type { SourceChunk } from "./analyze/parse.ts";
 import { chat, embed, hasChatKey, hasEmbedKey } from "./analyze/llm.ts";
 import type { SimNet } from "./network.ts";
@@ -58,12 +65,28 @@ function cosine(a: number[], b: number[]): number {
   return den === 0 ? 0 : dot / den;
 }
 
-export class QaEngine {
+/**
+ * 问答引擎（§4.10）。implements Asker —— ask 由它提供，不在 SimNet 上
+ * （问答需要"检索索引"这份额外原料，SimNet 只管知识网络）。
+ *
+ * `offline: true` ⇒ **强制**走纯本地路径（关键词检索 + 抽取式回答），
+ * 即使机器上恰好配了 Key 也不联网。l1-demo（保底演示）用它，
+ * 目的是让"离线保底"的输出在**任何机器上完全一致**，不因有无 Key 而变。
+ */
+export interface QaOptions {
+  offline?: boolean;
+}
+
+export class QaEngine implements Asker {
   private chunks: SourceChunk[];
+  private net: SimNet;
+  private offline: boolean;
   private chunkVecs: Array<{ chunk: SourceChunk; vec: number[] }> | null = null;
 
-  constructor(chunks: SourceChunk[]) {
+  constructor(chunks: SourceChunk[], net: SimNet, opts: QaOptions = {}) {
     this.chunks = chunks;
+    this.net = net;
+    this.offline = opts.offline ?? false;
   }
 
   get available(): number {
@@ -104,7 +127,7 @@ export class QaEngine {
   }
 
   private async retrieve(question: string, topK = TOP_K): Promise<{ scored: ScoredChunk[]; mode: "vector" | "keyword" }> {
-    if (hasEmbedKey()) {
+    if (!this.offline && hasEmbedKey()) {
       try {
         return { scored: await this.vectorRetrieve(question, topK), mode: "vector" };
       } catch {
@@ -144,34 +167,65 @@ export class QaEngine {
   }
 
   // ---------- 上下文包（§4.10：L3 完成标志④） ----------
-  private buildContext(net: SimNet, question: string): string {
-    // 找到相关问题涉及的知识点（用关键词命中的片段 locator 关键词 + 图里知识点名做粗略匹配）
-    const keys = queryTerms(question);
-    const related = new Set<string>();
+  /**
+   * 注入一份**只读**摘要，三项一个不少（§4.10 / §11）：
+   *   ① 相关点的 state（走 masteryOf）+ 该点相关题型的 kindState；
+   *   ② 相关真题（queryPoint）+ 结构化作答记录 AnswerRecord（该点最近 N=5 条）；
+   *   ③ 相关 HistoryEntry（最近 M=5 条）。
+   * 三项只读 —— 模型要改状态只能走 record()。
+   */
+  private buildContext(question: string): string {
+    const net = this.net;
+    // 相关点：问题字符串里直接出现了知识点名（最简可解释的匹配，粗但可复现）
+    const related: string[] = [];
     for (const p of net.topoOrder()) {
-      const norm = net.keyOf(p.name);
-      const nameHit = p.name.split("").length > 0 && question.includes(p.name);
-      if (nameHit) related.add(p.name);
+      if (p.name.length > 0 && question.includes(p.name)) related.push(p.name);
     }
-    const lines: string[] = [];
-    lines.push("【学习状态（只读）】");
+    if (related.length === 0) return "";
+
+    const lines: string[] = ["【学习状态（只读，模型不得据此改写 state）】"];
     for (const name of related) {
       const key = net.keyOf(name);
-      const mastery = net.state.get(key);
-      lines.push(`- ${name}: 掌握度 ${mastery === undefined ? "0.5(未学/先验)" : mastery.toFixed(2)}`);
-    }
-    // 相关真题 + 题型掌握度 + 结构化作答
-    for (const name of related) {
       const q = net.queryPoint({ name });
+      const mastery = net.state.get(key);
+      lines.push(
+        `- 知识点「${name}」：掌握度 ${
+          mastery === undefined ? "0.5（未学过，冷启动先验）" : mastery.toFixed(2)
+        }`,
+      );
       if (q.problems.length) {
-        lines.push(`- ${name} 相关真题：${q.problems.map((p) => p.name).join("、")}（题型：${q.kinds.join("、") || UNCLASSIFIED_KIND}）`);
+        lines.push(
+          `  相关真题：${q.problems.map((p) => p.name).join("、")}｜题型：${q.kinds.join("、") || UNCLASSIFIED_KIND}`,
+        );
+      }
+      // ② 题型掌握度（kindState）
+      for (const k of q.kinds.length ? q.kinds : [UNCLASSIFIED_KIND]) {
+        const km = net.kindState.get(k);
+        lines.push(`  题型「${k}」掌握度：${km === undefined ? "0.5（先验）" : km.toFixed(2)}`);
+      }
+      // ② 结构化作答记录（最近 N=5）
+      const recs = net.answers.filter((a) => a.pointNames.includes(key)).slice(-CONTEXT_ANSWERS);
+      if (recs.length) {
+        lines.push(
+          `  最近作答记录（最近 ${recs.length} 条 / 定值 N=${CONTEXT_ANSWERS}）：` +
+            recs.map((r) => `${r.problemName}[${r.kind}]→${r.status}`).join("；"),
+        );
+      }
+      // ③ 学习历史（最近 M=5）
+      const hists = net.history.filter((h) => (h.pointNames ?? []).includes(key)).slice(-CONTEXT_HISTORY);
+      if (hists.length) {
+        lines.push(
+          `  最近学习历史（最近 ${hists.length} 条 / 定值 M=${CONTEXT_HISTORY}）：` +
+            hists.map((h) => `${h.kind}:${h.detail}`).join("；"),
+        );
       }
     }
     return lines.join("\n");
   }
 
   // ---------- 主入口 ----------
-  async ask(question: string, net: SimNet): Promise<AskResult> {
+  async ask(question: string): Promise<AskResult> {
+    const net = this.net;
     const { scored, mode } = await this.retrieve(question);
 
     // 判定充足性
@@ -189,9 +243,9 @@ export class QaEngine {
     }
 
     // 有 Key 且充足 → 模型仅依据片段作答 + 注入只读上下文
-    if (hasChatKey()) {
+    if (!this.offline && hasChatKey()) {
       try {
-        const context = this.buildContext(net, question);
+        const context = this.buildContext(question);
         const answer = await this.modelAnswer(question, scored, context);
         net.record({ kind: "Ask", question, answer, citations: citations.slice(0, TOP_K) });
         return { question, answer, citations: citations.slice(0, TOP_K), sufficient: true };
@@ -213,24 +267,12 @@ export class QaEngine {
       .join("\n\n");
     const sys =
       "你是课程学习助手。只能依据用户提供的资料片段回答，禁止用你自身的常识补全；" +
-      "若片段不足以回答，请回复「资料不足」。回答要紧扣资料，并尽量在末尾注明引用的片段编号。";
+      "若片段不足以回答，请回复「资料不足」。回答要紧扣资料，并尽量在末尾注明引用的片段编号。" +
+      "上下文中的【学习状态】是只读信息，用于调整讲解的详略，不得当作资料依据。";
     const user = `${context}\n\n==资料片段（唯一依据）==\n${snippets}\n\n问题：${question}`;
     return chat([
       { role: "system", content: sys },
       { role: "user", content: user },
     ], { maxTokens: 800 });
   }
-}
-
-/** 汇总所有资料/真题的文本为检索片段。 */
-export function buildIndex(resources: Array<{ resource: Resource; text: string }>, chunkSize = 3000): SourceChunk[] {
-  const chunks: SourceChunk[] = [];
-  for (const r of resources) {
-    // 按标题切分（这里直接按段落，locator 用 resource 名 + 段序号）
-    const paras = r.text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
-    paras.forEach((text, i) => {
-      chunks.push({ resource: r.resource, locator: `${r.resource} · 第${i + 1}段`, text });
-    });
-  }
-  return chunks;
 }

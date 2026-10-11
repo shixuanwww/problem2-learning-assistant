@@ -5,11 +5,16 @@
 //   points / edges（充当模型输出的替身），不是用预置结果跳过。
 //   第 4 步"重启再读"通过另起一个进程跑 demo/verify-persist.ts 读回 state.json，证明真落盘。
 //
+//   🔁 幂等（2026-10-11 修复）：输入读 data/，产物写 data/.runtime/ 且启动前清空
+//      ⇒ 跑第 N 次的输出与第 1 次完全一致（见 demo/runtime.ts 顶部说明）。
+//
 //   运行：node --experimental-strip-types demo/l1-demo.ts
 // ============================================================================
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 import { SimNet } from "../src/network.ts";
-import { wireActions } from "../src/plan.ts";
+import { wireActions, proposePlan } from "../src/plan.ts";
+import { loadAliases } from "../src/normalize.ts";
 import {
   collectMdFiles,
   materialToChunks,
@@ -18,9 +23,9 @@ import {
   readText,
 } from "../src/analyze/parse.ts";
 import { QaEngine } from "../src/qa.ts";
+import { DATA, RUNTIME, resetRuntime } from "./runtime.ts";
 import type { AnalyzeResReq, Edge, Problem, Resource } from "../src/types.ts";
-
-const DATA = "data";
+import { UNCLASSIFIED_KIND } from "../src/types.ts";
 
 function materialReq(file: string): AnalyzeResReq {
   const text = readText(file);
@@ -40,9 +45,8 @@ function problemFromFile(file: string): Problem {
 function line(title: string) {
   console.log(`\n${"=".repeat(64)}\n## ${title}\n${"=".repeat(64)}`);
 }
-function fmtPlan(net: SimNet): string {
-  return net
-    .makePlan()
+function fmtPlan(net: SimNet, plan = net.makePlan()): string {
+  return plan
     .map((p) => {
       const acts = p.actions.map((a) => {
         if (a.kind === "Read") return `读(${a.resource.split("/").pop()})`;
@@ -55,12 +59,18 @@ function fmtPlan(net: SimNet): string {
 }
 
 async function main() {
+  resetRuntime(); // 🔁 幂等：清掉上次演示的产物
   const materials = collectMdFiles(`${DATA}/materials`).sort();
   const problems = collectMdFiles(`${DATA}/problems`).sort().filter((f) => f.endsWith(".prob.md"));
 
   console.log(`课程资料：${materials.length} 份；真题：${problems.length} 道`);
+  console.log(`输入目录：${DATA}/（只读）｜产物目录：${RUNTIME}/（本次已清空，演示可重复）`);
 
-  const net = new SimNet({ dataDir: DATA });
+  const net = new SimNet({
+    dataDir: RUNTIME,
+    aliases: loadAliases(path.join(DATA, "aliases.json")),
+    skipLoad: true,
+  });
   wireActions(net);
 
   // ---------- 第 1 步：接入资料，后台处理 ----------
@@ -69,7 +79,7 @@ async function main() {
   net.integrate({ kind: "ResReq", data: materialReq(first) });
   console.log(`  ✓ 已接入：${first}`);
   console.log(`  理由：解析该资料得到它的知识点与前置关系，作为知识体系的一部分。`);
-  console.log(`  当前知识点：${net.graph.filter((n) => !n.dead).map((n) => n.name).join("、")}`);
+  console.log(`  当前知识点：${net.alivePoints().map((p) => p.name).join("、")}`);
 
   // ---------- 第 2 步：再接入更多，构建并更新知识体系、学习计划 ----------
   line("第 2 步：根据多份资料构建并继续更新知识体系、学习计划");
@@ -78,28 +88,30 @@ async function main() {
   console.log(`  ✓ 继续接入 ${rest.length} 份资料`);
 
   const beforeProblems = net.problems.length;
-  const beforeMention = net.pointMention.slice();
   for (const pf of problems) {
     const prob = problemFromFile(pf);
-    net.integrate({
-      kind: "ProReq",
-      data: { problem: prob, points: prob.points },
-    });
+    net.integrate({ kind: "ProReq", data: { problem: prob, points: prob.points } });
   }
   console.log(`  ✓ 接入 ${problems.length} 道真题，知识体系"长了"：`);
-  console.log(`    知识点：${net.graph.filter((n) => !n.dead).map((n) => n.name).join("、")}`);
-  console.log(`    新增真题 ${net.problems.length - beforeProblems} 道；考频 pointMention=[${net.pointMention.join(", ")}]`);
+  console.log(`    知识点：${net.alivePoints().map((p) => p.name).join("、")}`);
+  console.log(
+    `    新增真题 ${net.problems.length - beforeProblems} 道；考频 pointMention=[${net.pointMention.join(", ")}]`,
+  );
   console.log(`  理由：持续上传让体系由"资料→知识点"扩展到"知识点-真题-资料"三者的关系网络，并累计考频。`);
 
   // 查询一个点：同时看到资料、真题、题型（题面 L2 完成标志②）
-  const q = net.queryPoint({ name: "整数加减" });
-  console.log(`  queryPoint(整数加减)：资料=${q.resources.length} 份，真题=${q.problems.map((p) => p.name).join("、")}，题型=${q.kinds.join("、")}`);
+  const focusName =
+    problems.length > 0 ? problemFromFile(problems[0]).points[0]?.name ?? "整数加减" : "整数加减";
+  const q = net.queryPoint({ name: focusName });
+  console.log(
+    `  queryPoint(${focusName})：资料=${q.resources.length} 份，真题=${q.problems.map((p) => p.name).join("、")}，题型=${q.kinds.join("、")}`,
+  );
 
   const rank = net.pointRank(3);
   console.log(`  考频前三 pointRank(3)：${rank.map((p) => p.name).join("、")}`);
 
   const planBefore = net.makePlan();
-  console.log(`  学习计划（现在）：\n${fmtPlan(net)}`);
+  console.log(`  学习计划（现在）：\n${fmtPlan(net, planBefore)}`);
 
   // ---------- 第 3 步：基于资料问答（带来源 + 资料不足拒绝） ----------
   line("第 3 步：基于资料进行带来源的问答");
@@ -107,36 +119,49 @@ async function main() {
     resource: m,
     text: readText(m),
   }));
-  const qa = new QaEngine(
-    chunkResources.flatMap((r) => materialToChunks(r.resource, r.text)),
-  );
-  const present = await qa.ask("整数加减法是什么", net);
-  console.log(`  Q: 整数加减法是什么`);
+  // offline: true ⇒ 即使本机配了 Key 也不联网，保证"保底演示"在任何机器上输出一致
+  const qa = new QaEngine(chunkResources.flatMap((r) => materialToChunks(r.resource, r.text)), net, {
+    offline: true,
+  });
+  const present = await qa.ask(`${focusName}法是什么`);
+  console.log(`  Q: ${focusName}法是什么`);
   console.log(`    充足=${present.sufficient}；回答=${(present.answer ?? "").slice(0, 60)}`);
   console.log(`    出处：${present.citations.map((c) => `${c.resource} / ${c.locator}`).join("；")}`);
 
-  const absent = await qa.ask("二次根式怎么化简", net);
+  const absent = await qa.ask("二次根式怎么化简");
   console.log(`  Q: 二次根式怎么化简（资料里没有）`);
-  console.log(`    充足=${absent.sufficient}；回答=${absent.answer === null ? "【资料不足，拒绝编造】" : absent.answer}`);
+  console.log(
+    `    充足=${absent.sufficient}；回答=${absent.answer === null ? "【资料不足，拒绝编造】" : absent.answer}`,
+  );
 
   // ---------- 第 4 步：记录一次真题作答（做错）→ 更新知识点、题型掌握度 ----------
   line("第 4 步：记录一份真题作答情况，据此更新知识点、题型掌握度");
-  const target = problemFromFile(`${DATA}/problems/2023-期末-第1题.prob.md`);
-  const beforeMastery = net.state.get("整数加减") ?? 0.5;
-  const beforeKind = net.kindState.get("计算") ?? 0.5;
+  const target = problemFromFile(problems[0]);
+  const targetPoint = target.points[0]?.name ?? focusName;
+  const targetKind = target.kind ?? UNCLASSIFIED_KIND;
+  const targetKey = net.keyOf(targetPoint);
+  const beforeMastery = net.state.get(targetKey) ?? 0.5; // 冷启动先验 0.5（§11）
+  const beforeKind = net.kindState.get(targetKind) ?? 0.5;
   net.record({ kind: "Do", problem: target, status: "incorrect" });
-  const afterMastery = net.state.get("整数加减") ?? 0.5;
-  const afterKind = net.kindState.get("计算") ?? 0.5;
-  console.log(`  ✓ 作答「${target.name}」→ 错误（涉及知识点：${target.points.map((p) => p.name).join("、")}，题型：${target.kind}）`);
-  console.log(`    知识点「整数加减」掌握度：${beforeMastery.toFixed(2)} → ${afterMastery.toFixed(2)}（错误 -0.25，裁剪到 [0,1]）`);
-  console.log(`    题型「计算」掌握度：${beforeKind.toFixed(2)} → ${afterKind.toFixed(2)}（同公式同幅度）`);
-  console.log(`  理由：做错用 masteryOf() 读旧值（先验 0.5）再减，避免从 0 减被裁剪回 0 导致状态"纹丝不动"。`);
+  const afterMastery = net.state.get(targetKey) ?? 0.5;
+  const afterKind = net.kindState.get(targetKind) ?? 0.5;
+  console.log(
+    `  ✓ 作答「${target.name}」→ 错误（涉及知识点：${target.points.map((p) => p.name).join("、")}，题型：${targetKind}）`,
+  );
+  console.log(
+    `    知识点「${targetPoint}」掌握度：${beforeMastery.toFixed(2)} → ${afterMastery.toFixed(2)}（错误 -0.25，裁剪到 [0,1]）`,
+  );
+  console.log(`    题型「${targetKind}」掌握度：${beforeKind.toFixed(2)} → ${afterKind.toFixed(2)}（同公式同幅度）`);
+  console.log(
+    `  理由：先用 masteryOf() 读旧值（冷启动先验 0.5）再减，而不是从 0 减 —— 否则会被裁剪回 0，状态"纹丝不动"。`,
+  );
 
   // 另起一个进程读回 state.json，证明真落盘
   console.log(`\n  —— 另起一个进程跑 demo/verify-persist.ts ——`);
   try {
-    const out = execFileSync("node", ["--experimental-strip-types", "demo/verify-persist.ts"], {
+    const out = execFileSync(process.execPath, ["--experimental-strip-types", "demo/verify-persist.ts"], {
       encoding: "utf8",
+      env: { ...process.env, T2_DATA_DIR: DATA, T2_RUNTIME_DIR: RUNTIME },
     });
     console.log(out.trim());
   } catch (e) {
@@ -146,16 +171,38 @@ async function main() {
   // ---------- 第 5 步：重新 makePlan → 根据表现调整之后的行为计划 ----------
   line("第 5 步：经过学习与做题后，AI 依据学习表现调整之后的行为计划");
   const planAfter = net.makePlan();
-  const originalTarget = planBefore.find((p) => p.point.name === "整数加减");
-  const afterTarget = planAfter.find((p) => p.point.name === "整数加减");
+  const originalTarget = planBefore.find((p) => net.keyOf(p.point.name) === targetKey);
+  const afterTarget = planAfter.find((p) => net.keyOf(p.point.name) === targetKey);
   const actsBefore = originalTarget?.actions.length ?? 0;
   const actsAfter = afterTarget?.actions.length ?? 0;
-  console.log(`  「整数加减」学习动作数：${actsBefore} → ${actsAfter}（加量：做错后追加回炉题）`);
-  console.log(`  更新后的学习计划：\n${fmtPlan(net)}`);
-  if (afterTarget && afterTarget.actions.some((a) => a.kind === "Do")) {
-    console.log(`  回炉题依据：数据 data/answers.json 里「整数加减」存在 status≠correct 的作答记录 ⇒ 计划为其追加回炉题。`);
+  console.log(`  「${targetPoint}」学习动作数（做错前 → 做错后）：${actsBefore} → ${actsAfter}`);
+  if (actsAfter > actsBefore) {
+    console.log(`  ✅ 真实断言通过：做错后薄弱点动作数确实增加（+${actsAfter - actsBefore}，追加回炉题）`);
+  } else {
+    console.error(`  ❌ 真实断言失败：做错后动作数未增加（${actsBefore} → ${actsAfter}）⇒ 演示终止`);
+    process.exit(1);
   }
-  console.log(`  —— 说明：变化严格落在拓扑序可行域内（同层前移/加量动作），未破坏前置约束。`);
+  console.log(`  更新后的学习计划：\n${fmtPlan(net, planAfter)}`);
+  if (afterTarget && afterTarget.actions.some((a) => a.kind === "Do")) {
+    console.log(
+      `  回炉题依据：${RUNTIME}/answers.json 里「${targetPoint}」存在 status≠correct 的作答记录 ⇒ 计划为其追加回炉题。`,
+    );
+  }
+  console.log(`  —— 说明：变化严格落在拓扑序可行域内（同层前移 / 加量动作），未破坏前置约束。`);
+
+  // ---------- 补充演示（§4.13）：模型提议被拒 → 回落规则版计划 ----------
+  line("补充演示：模型提议被拒 → 回落规则版计划（§4.13 / §8 用例 10·18）");
+  const badDraft = [
+    { pointName: targetPoint, actions: [{ kind: "Read", resource: "data/不存在的资料.md" }] },
+    { pointName: "向量运算", actions: [{ kind: "Explain" }] },
+  ];
+  console.log("  模型提议（故意非法：引用了不存在的资料 + 不存在的知识点）：");
+  console.log(`    ${JSON.stringify(badDraft)}`);
+  const res = proposePlan(net, badDraft);
+  console.log(`  ⇒ accepted=${res.accepted}`);
+  for (const r of res.rejected ?? []) console.log(`     拒绝理由：${r}`);
+  console.log(`  ⇒ 拒绝已记入决策日志 ${RUNTIME}/decisions.json（当前 ${net.decisions.length} 条）`);
+  console.log(`  ⇒ 回落到 §4.7 规则版计划（仍可用、且满足拓扑序）：\n${fmtPlan(net)}`);
 
   console.log(`\n✅ l1-demo：5 步全部走完（离线、无外部依赖）。`);
 

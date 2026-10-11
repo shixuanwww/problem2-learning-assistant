@@ -1,15 +1,17 @@
 // ============================================================================
-// demo/verify-persist.ts — §9.2 第 4 步：另起一个进程读回 data/ 持久化，证明"真落盘"。
-//   载入 data/graph.json（知识体系）与 data/state.json（学习状态），校验两者仍在。
+// demo/verify-persist.ts — §9.2 第 4 步：另起一个进程读回落盘数据，证明"真落盘"。
+//   载入 graph.json（知识体系）与 state.json（学习状态），校验两者仍在。
 //   命令行：node --experimental-strip-types demo/verify-persist.ts
-//   可用环境变量 DATA_DIR 指定目录（默认 data，测试时指向临时夹具）。
+//   目录：与 demo/l1-demo.ts / full-demo.ts 共用 demo/runtime.ts 的解析口径
+//         （T2_DATA_DIR / T2_RUNTIME_DIR），保证"写在哪就读哪"。
 // ============================================================================
 import { SimNet } from "../src/network.ts";
+import { RUNTIME } from "./runtime.ts";
 
-const dir = process.env.DATA_DIR ?? "data";
+const dir = RUNTIME;
 const net = new SimNet({ dataDir: dir });
 
-const graphPoints = net.graph.filter((n) => !n.dead).length;
+const graphPoints = net.alivePoints().length;
 const stateEntries = [...net.state.entries()];
 const kindEntries = [...net.kindState.entries()];
 

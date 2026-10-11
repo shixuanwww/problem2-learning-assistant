@@ -9,9 +9,11 @@
 // ============================================================================
 import type { AnalyzeProReq, AnalyzeResReq, Edge, Point, Problem, Resource } from "../types.ts";
 import { UNCLASSIFIED_KIND } from "../types.ts";
+import { readJSON } from "../store.ts";
 import { chat } from "./llm.ts";
 import { validateProOutput, validateResOutput } from "./schema.ts";
-import { materialToChunks, parseMaterialRelations, parseProblemRelations, readText } from "./parse.ts";
+import { materialToChunks, parseMaterialRelations, readText } from "./parse.ts";
+import path from "node:path";
 
 const EXTRACT_SYS =
   "你是课程知识抽取器。输入是一段课程资料片段，请抽取其中的知识点，以及知识点之间的前置关系。\n" +
@@ -76,8 +78,32 @@ async function modelExtractRes(text: string, resource: Resource): Promise<{ poin
 }
 
 /**
- * 分析一份资料 → AnalyzeResReq。
- * 优先路 B（md 声明）；无声明且需要模型时才走路 A；失败时回落到 presets 或抛错。
+ * 兜底：读 `data/presets/analyze-req.json` 里该文件的预置结果。
+ * 触发条件 = md 里没写 `## 知识点:` / `## 前置:` 声明，且模型又不可用/抽不出点。
+ * （PLAN §4.11 明确 presets **只作兜底**，不参与正常路径。）
+ */
+function loadPreset(dataDir: string, resource: Resource): AnalyzeResReq | null {
+  const raw = readJSON(path.join(dataDir, "presets", "analyze-req.json"));
+  if (!raw || typeof raw !== "object") return null;
+  const list = (raw as { resources?: unknown }).resources;
+  if (!Array.isArray(list)) return null;
+  const hit = list.find(
+    (x): x is { resource: string; points: Point[]; edges: Edge[] } =>
+      !!x && typeof x === "object" && (x as { resource?: unknown }).resource === resource,
+  );
+  if (!hit) return null;
+  return {
+    resource,
+    points: (hit.points ?? []).map((p) => ({ name: p.name })),
+    edges: (hit.edges ?? []).map(([a, b]) => [{ name: a.name }, { name: b.name }] as Edge),
+  };
+}
+
+/**
+ * 分析一份资料 → AnalyzeResReq。三级路径，逐级回退：
+ *   ① 路 B（md 里有显式声明）→ 直接切出，**离线可用、优先**；
+ *   ② 路 A（需要模型）→ 逐块抽取 + schema 校验；
+ *   ③ 兜底 presets（data/presets/analyze-req.json）→ 前两级都拿不到时才用。
  */
 export async function analyzeResource(
   resource: Resource,
@@ -87,7 +113,7 @@ export async function analyzeResource(
   if (!text) throw new Error(`读取资料失败：${resource}`);
 
   const rel = parseMaterialRelations(text);
-  // 路 B：md 里有显式声明 → 直接切出（离线可用）
+  // ① 路 B：md 里有显式声明 → 直接切出（离线可用）
   if (!opts.forceModel && (rel.points.length > 0 || rel.edges.length > 0)) {
     return {
       resource,
@@ -96,13 +122,23 @@ export async function analyzeResource(
     };
   }
 
-  // 路 A：需模型
-  const { points, edges } = await modelExtractRes(text, resource);
-  if (points.length === 0) {
-    // 模型没能抽出点 → 免除脏数据：抛错（上层可回落 presets）
-    throw new Error(`资料「${resource}」未能抽出任何知识点`);
+  // ② 路 A：需模型
+  let modelError = "";
+  try {
+    const { points, edges } = await modelExtractRes(text, resource);
+    if (points.length > 0) return { resource, points, edges };
+    modelError = "模型未能抽出任何知识点";
+  } catch (e) {
+    modelError = String(e);
   }
-  return { resource, points, edges };
+
+  // ③ 兜底：presets（避免"模型抽不出点"就整份资料进不去体系）
+  const preset = loadPreset(opts.dataDir, resource);
+  if (preset) {
+    console.warn(`[analyze] ${resource} 模型抽取失败（${modelError.slice(0, 80)}）⇒ 回落 presets 兜底`);
+    return preset;
+  }
+  throw new Error(`资料「${resource}」既无 md 关系声明、模型又不可用（${modelError}），且 presets 里无兜底`);
 }
 
 /** 分析一道真题 → AnalyzeProReq。points 为空时用模型补；否则直接带回。 */
@@ -122,15 +158,4 @@ export async function analyzeProblem(problem: Problem): Promise<AnalyzeProReq> {
     if (!v.ok) throw new Error(`真题「${problem.name}」知识点抽取 schema 校验失败：${v.errors.join("；")}`);
   }
   return { problem: { ...problem, kind: problem.kind ?? UNCLASSIFIED_KIND }, points: v.points };
-}
-
-/** 从一份真题 md 文件内容直接构造 Problem（路 B：直接取声明）。 */
-export function problemFromMd(content: string): Problem {
-  const p = parseProblemRelations(content);
-  return {
-    name: p.name,
-    content: p.content,
-    kind: p.kind || UNCLASSIFIED_KIND,
-    points: p.points.map((n) => ({ name: n })),
-  };
 }

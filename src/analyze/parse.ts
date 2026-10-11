@@ -12,7 +12,6 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { Resource } from "../types.ts";
 import { UNCLASSIFIED_KIND } from "../types.ts";
-import { canonicalize, normalize, type AliasTable } from "../normalize.ts";
 
 /** 被检索引用的"带出处"片段（对应 §3 Citation 的前置形态）。 */
 export interface SourceChunk {
@@ -190,10 +189,3 @@ export function readText(file: string): string {
     return "";
   }
 }
-
-/** 标准化科目/名称：路 A 常用（供 analyzeRes 里对规范化名做别名处理）。 */
-export function canonicalPointName(name: string, aliases: AliasTable): string {
-  return canonicalize(name, aliases);
-}
-
-export { normalize };
