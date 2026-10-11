@@ -13,7 +13,9 @@ import {
   type LearnPlan,
   type PlanProposalResult,
   type Problem,
+  type Resource,
   MASTERY_THRESHOLD,
+  UNCLASSIFIED_KIND,
   masteryOf,
 } from "./types.ts";
 import type { SimNet } from "./network.ts";
@@ -31,6 +33,14 @@ export function wireActions(net: SimNet): void {
  *   3 已掌握（>=阈值）：只留一道巩固题（"排到后面"交给 makePlan 的排序键，不在此重排）
  *   4 前置不足：在本点动作序列最前补一个指向前置点资料的 Read 或 Explain
  *   5 选回炉题的依据取自 data/answers.json 的 AnswerRecord（不解析人类可读文本）
+ *   6 主/回炉题都**优先选薄弱题型**（kindState < 阈值）的真题 —— 见 pickProblem
+ *
+ * 【2026-10-11 审核后修】规则 4 的 Read 与规则 1 的 Read 常指向**同一份资料**
+ * （前置点与本点常在同一份教材里），修前会生成"读同一份资料两遍"的冗余动作；
+ * 现在统一走 `pushRead` 去重（去重键 = 归一化后的资源路径）。
+ *
+ * 【2026-10-11 审核后修】规则 6 是补上的：题面 L3 完成标志③要的是"增加薄弱**题型**训练"，
+ * 而修前 `kindState` 只被写、不被读 ⇒ 题型掌握度对计划毫无影响（评审一问就穿）。
  */
 export function fillActions(net: SimNet, point: { name: string; pid?: number }): LearnAction[] {
   const key = net.keyOf(point.name);
@@ -40,6 +50,19 @@ export function fillActions(net: SimNet, point: { name: string; pid?: number }):
   const mastered = mastery >= MASTERY_THRESHOLD;
 
   const actions: LearnAction[] = [];
+  const readSeen = new Set<string>();
+  const pushRead = (rawResource: Resource): void => {
+    const dedupKey = rawResource.replace(/\\/g, "/").trim();
+    if (readSeen.has(dedupKey)) return; // 同一份资料只读一次
+    readSeen.add(dedupKey);
+    actions.push({ kind: "Read", resource: rawResource });
+  };
+  /** 本点涉及的题型里，掌握度低于阈值的（= 薄弱题型），按题型名升序保证确定性。 */
+  const weakKinds = (): string[] =>
+    net
+      .queryPoint({ name: point.name })
+      .kinds.filter((k) => masteryOf(net.kindState, k) < MASTERY_THRESHOLD)
+      .sort();
 
   // 规则 4：前置不足 → 最前补一个前置点资料或讲解（只影响本点动作，不调整知识点顺序）
   if (pid !== undefined) {
@@ -47,9 +70,10 @@ export function fillActions(net: SimNet, point: { name: string; pid?: number }):
       if (prv.pid === undefined) continue;
       if (masteryOf(net.state, net.keyOf(prv.name)) < MASTERY_THRESHOLD) {
         const prvResources = net.graph[prv.pid].resources;
-        actions.push(prvResources.length > 0
-          ? { kind: "Read", resource: prvResources[0] }
-          : { kind: "Explain" });
+        // 用唯一一个连接两个点的 action 占位（去重交给 pushRead / readSeen）：
+        // 前置点的资料若与本点资料相同，下面的规则 1 就不会再重复插一次。
+        if (prvResources.length > 0) pushRead(prvResources[0]);
+        else actions.push({ kind: "Explain" });
         break;
       }
     }
@@ -57,47 +81,66 @@ export function fillActions(net: SimNet, point: { name: string; pid?: number }):
 
   if (!mastered) {
     // 规则 1：先读资料（优先与薄弱题型相关，简化取第一个）+ 讲解
-    if (resources.length > 0) actions.push({ kind: "Read", resource: resources[0] });
+    if (resources.length > 0) pushRead(resources[0]);
     actions.push({ kind: "Explain" });
   }
 
-  // 规则 2 + 3：选一道"主"真题（优先考频高，排除回炉题），再把"回炉"真题作为额外加量
+  // 规则 2 + 3 + 6：选一道"主"真题（优先薄弱题型，排除回炉题），再把"回炉"真题作为额外加量
   const reviewNames = new Set(net.reviewProblemNames({ name: point.name }));
-  const primary = pickProblem(net, { name: point.name, pid }, reviewNames);
+  const weak = weakKinds();
+  const primary = pickProblem(net, { name: point.name, pid }, reviewNames, weak);
   if (primary) {
     actions.push({ kind: "Do", problem: primary });
   }
   if (!mastered) {
-    // 回炉加量：该点答错/糊涂过的题再各追加一道（§4.2 允许的"加量/提前动作"）
-    for (const probName of reviewNames) {
-      const rp = net.problemByName(probName);
-      if (rp && (!primary || rp.name !== primary.name)) {
-        actions.push({ kind: "Do", problem: rp });
-      }
-    }
+    // 回炉加量：该点答错/糊涂过的题再各追加一道（§4.2 允许的"加量/提前动作"），
+    // 同为回炉题时**薄弱题型优先**（规则 6）。
+    const reviewProbs = [...reviewNames]
+      .map((n) => net.problemByName(n))
+      .filter((p): p is Problem => p !== undefined)
+      .filter((p) => !primary || p.name !== primary.name)
+      .sort((a, b) => {
+        const wa = weak.includes(a.kind ?? UNCLASSIFIED_KIND) ? 0 : 1;
+        const wb = weak.includes(b.kind ?? UNCLASSIFIED_KIND) ? 0 : 1;
+        if (wa !== wb) return wa - wb;
+        return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+      });
+    for (const rp of reviewProbs) actions.push({ kind: "Do", problem: rp });
   }
 
   return actions;
 }
 
-/** 选一道"主"真题（不选回炉；回炉由 fillActions 的加量循环处理）。 */
+/**
+ * 选一道"主"真题（不选回炉；回炉由 fillActions 的加量循环处理）。
+ *
+ * 打分顺序（与 §4.2 的计划排序键同思路：先看"用户会不会"，再看"考不考"，最后用名字保证确定性）：
+ *   ① 薄弱题型优先（`weakKinds` 命中）—— 题面 L3 完成标志③"增加薄弱题型训练"；
+ *   ② 该题覆盖知识点的最高考频（考得多的更值得练）；
+ *   ③ 题目名码点序（确定性，避免同一份数据两次跑出不同计划）。
+ */
 function pickProblem(
   net: SimNet,
   point: { name: string; pid?: number },
   exclude: Set<string> = new Set(),
+  weakKinds: string[] = [],
 ): Problem | undefined {
-  // 选"主"真题：覆盖本点、且其 points 中 max(pointMention) 最高（考频最高）的题；
-  // 排除回炉题（回炉题由 fillActions 的加量循环单独追加，保证做错后动作数真正增加）。
   const q = net.queryPoint({ name: point.name });
   let best: Problem | undefined;
-  let bestScore = -1;
+  let bestScore: [number, number] | null = null;
   for (const prob of q.problems) {
     if (exclude.has(prob.name)) continue;
+    const weakFirst = weakKinds.includes(prob.kind ?? UNCLASSIFIED_KIND) ? 0 : 1;
     const mentions = prob.points
       .map((pp) => (pp.pid !== undefined ? net.pointMention[pp.pid] : 0))
       .concat([0]);
-    const score = Math.max(...mentions);
-    if (score > bestScore) {
+    const score: [number, number] = [weakFirst, -Math.max(...mentions)];
+    if (
+      bestScore === null ||
+      score[0] < bestScore[0] ||
+      (score[0] === bestScore[0] && score[1] < bestScore[1]) ||
+      (score[0] === bestScore[0] && score[1] === bestScore[1] && best !== undefined && prob.name < best.name)
+    ) {
       bestScore = score;
       best = prob;
     }
