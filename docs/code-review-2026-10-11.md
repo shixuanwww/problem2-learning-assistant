@@ -1,6 +1,6 @@
 # T2 代码审核报告（2026-10-11）
 
-审核人：WorkBuddy｜审核对象：`D:\aoce\problem2-learning-assistant`（执行者 = DSH）
+审核人：WorkBuddy｜审核对象：`D:\aoce\problem2-learning-assistant`
 审核方式：**全部结论均有实测证据**（跑测试 / 跑 demo / 跑 tsc / 读运行时对象），不凭印象。
 对照基准：该题 `PLAN.md`（838 行）+ `docs/problem-statement.md`（题面原文，冲突时以它仲裁）。
 
@@ -231,6 +231,16 @@ $ node … demo/l1-demo.ts | grep -E "掌握度|动作数"
 | `tsc --noEmit --strict`（10 个源文件） | 6 类错误：5 类来自缺 `@types/node`（非缺陷），**1 类是真缺陷**（§1.1 `SimNet` 缺 `ask`） |
 
 > ⚠️ **对"22/22 全通过"这个说法的口径修正**：在**有子进程权限**的机器上，22 条应当全绿（我手工验证了这两个用例的等价行为：`verify-persist` PASS、`l1-demo` 5 步走完）；但本审核**只能确认 20 条**，另 2 条因沙箱限制**未能在本机验证** —— 这条差别必须如实记录，不替它背书。
+
+> 🔧 **同日 17:20 更正：上面"本审核沙箱禁止派生子进程"这个根因结论是错的。**
+> 后来用参数矩阵（临时探针 `tests/zz-probe.test.ts`，跑完即删）逐项排查，确认真正的触发条件是
+> **`execFileSync` 没有显式传 `stdio`**：不传 ⇒ spawn 直接 `EBUSY`；显式传 `["ignore","pipe","pipe"]`
+> ⇒ 正常，且照样能拿到 stdout 做断言（同一进程内对照：`stdio:'ignore'` 全 OK、默认 stdio 必 EBUSY；
+> 跑 `-e 0` 与跑真实脚本表现一致）。**换系统 node 同样失败也是同一个原因，不是"环境歧视"。**
+> ⇒ 这**不是**环境禁止子进程，而是**可修的调用方式问题**，已修：`tests/persist.test.ts`、
+> `tests/demo.test.ts`、`demo/l1-demo.ts`、`demo/full-demo.ts` 四处统一显式 `stdio`，
+> 现状 **46 pass / 0 fail / 0 skip**。另加 `tests/helpers.ts:spawnBlockedReason()` 兜底。
+> （教训：把"我无法解释的现象"直接写成"环境所致"，下得太快了 —— 一个两行的参数矩阵就能证伪。）
 
 ---
 

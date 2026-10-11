@@ -16,7 +16,7 @@ node --version        # ⚠ 先看这条：需要 Node ≥ 22.6（本项目用 N
 npm run demo          # ⭐ 保底演示：零依赖、离线可跑、确定性输出，走完题面 5 步
 npm run demo:full     # 完整演示：模型抽取 + 带出处问答 + 模型提议计划（无 Key 自动降级）
 npm run serve         # 网页壳（9 条 API + 3 个页面）→ http://127.0.0.1:8787
-npm test              # 44 条验收用例（含网页壳端到端）
+npm test              # 46 条验收用例（含网页壳端到端；本机 46 pass / 0 fail）
 ```
 
 等价的手写命令（不想用 npm scripts 时）：
@@ -401,6 +401,7 @@ DecisionEntry{ at, action, reasons, draft }  模型提议的接受/拒绝留痕�
 - **首页知识点图谱**：纯前端原生 SVG 的**分层 DAG 图**（`public/index.html`，后端零改动）——悬停高亮链路、点击看详情、孤立点单独成列（见 §7.1）
 - **启动接入幂等**（`src/ingest-ledger.ts`）：按内容 sha256 记账，`serve` 重启不重复抽取 ⇒ 图不膨胀
 - `§8` 验收用例 **46 条**（含 6 条网页壳端到端：子进程起真实 server + 真发 HTTP，覆盖"模型挂了如何如实回落"；另有 2 条记账幂等用例）
+  —— 本机 **46 pass / 0 fail / 0 skip**；若某环境**真的**完全禁子进程，跨进程那几条会**自动 skip 并写明原因**（`tests/helpers.ts:spawnBlockedReason()`），**不会**把"进程起来了却失败"也吞成 skip
 
 **未实现 / 已知限制**
 - **语义合并**（用 embedding 找同义知识点）默认**不做** —— 只做字符串归一 + 别名表 +
