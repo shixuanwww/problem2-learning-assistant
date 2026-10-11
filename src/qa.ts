@@ -75,22 +75,53 @@ function cosine(a: number[], b: number[]): number {
  */
 export interface QaOptions {
   offline?: boolean;
+  /**
+   * **测试注入口**：非 null 时，走"模型"的那条路径直接返回这个字符串（空串 = 模拟模型失败）。
+   * 用它可以在**不联网**的前提下测两件容易出错的事：
+   *   ① 模型自己回答"资料不足" ⇒ 必须转成 answer=null + sufficient=false（§4.10）；
+   *   ② 模型失败 ⇒ 抽取式降级。
+   * 生产路径（server.ts / demo）不传这个字段，行为与不注入完全一致。
+   */
+  answerOverride?: string | null;
 }
 
 export class QaEngine implements Asker {
   private chunks: SourceChunk[];
   private net: SimNet;
   private offline: boolean;
+  private answerOverride: string | null;
   private chunkVecs: Array<{ chunk: SourceChunk; vec: number[] }> | null = null;
 
   constructor(chunks: SourceChunk[], net: SimNet, opts: QaOptions = {}) {
     this.chunks = chunks;
     this.net = net;
     this.offline = opts.offline ?? false;
+    this.answerOverride = opts.answerOverride ?? null;
   }
 
   get available(): number {
     return this.chunks.length;
+  }
+
+  /**
+   * 【2026-10-11 审核后修】切换离线档：`offline: true` 时**任何**路径都不联网。
+   * 用于单测"模型即使回答「资料不足」，也必须转成 answer=null"这条判定
+   * （原来只能靠 `offline: true` 把模型整段关掉，测不到模型路径）。
+   */
+  setOffline(offline: boolean): void {
+    this.offline = offline;
+  }
+
+  /**
+   * 模型有没有**自己说**"资料不足"。
+   * 题面要求"资料不足以支持答案时系统应提示资料不足，而不是依赖模型自身知识补全"——
+   * 所以这里必须再检一道：模型明确拒答时，不能把这句话当成"有效回答"返回，
+   * `sufficient` 也要跟着降为 false（检索阈值只是"资料够不够检索"，模型才是最后一道闸）。
+   */
+  isModelInsufficient(answer: string): boolean {
+    return /资料不足|信息不足|无法(?:回答|回答该|作答|确定)|不足以(?:回答|支持)|没有(?:相关|足够)(?:的)?(?:资料|信息|内容)|文中未(?:提及|涉及)/.test(
+      answer,
+    );
   }
 
   private async vectorRetrieve(question: string, topK: number): Promise<ScoredChunk[]> {
@@ -243,10 +274,18 @@ export class QaEngine implements Asker {
     }
 
     // 有 Key 且充足 → 模型仅依据片段作答 + 注入只读上下文
-    if (!this.offline && hasChatKey()) {
+    // （answerOverride 是测试注入口：注入时即使没配 Key 也走这条路径，见 QaOptions）
+    const tryModel = !this.offline && (hasChatKey() || this.answerOverride !== null);
+    if (tryModel) {
       try {
         const context = this.buildContext(question);
         const answer = await this.modelAnswer(question, scored, context);
+        // 🔴 模型自己说"资料不足" ⇒ 不得当有效回答返回：answer=null + sufficient=false。
+        //    （检索阈值只回答"检索够不够"，模型这一层才是最后一道闸门。）
+        if (this.isModelInsufficient(answer)) {
+          net.record({ kind: "Ask", question, answer: null, citations: citations.slice(0, TOP_K) });
+          return { question, answer: null, citations: citations.slice(0, TOP_K), sufficient: false };
+        }
         net.record({ kind: "Ask", question, answer, citations: citations.slice(0, TOP_K) });
         return { question, answer, citations: citations.slice(0, TOP_K), sufficient: true };
       } catch {
@@ -262,6 +301,12 @@ export class QaEngine implements Asker {
   }
 
   private async modelAnswer(question: string, scored: ScoredChunk[], context: string): Promise<string> {
+    // 测试注入口（见 QaOptions.answerOverride）：不走网络也能验"模型说资料不足"的处理。
+    if (this.answerOverride !== null) {
+      if (this.answerOverride === "")
+        throw new Error("answerOverride 为空 ⇒ 模拟模型调用失败（用于测抽取式降级）");
+      return this.answerOverride;
+    }
     const snippets = scored
       .map((s, i) => `[${i + 1}] (${s.chunk.resource} / ${s.chunk.locator}) ${s.chunk.text}`)
       .join("\n\n");

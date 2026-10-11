@@ -110,7 +110,6 @@ async function loadGraph() {
     : "";
 
   const rows = d.points
-    .slice()
     .sort((a, b) => b.mention - a.mention)
     .map((p) => `<tr>
       <td>${p.name}</td>
@@ -121,7 +120,7 @@ async function loadGraph() {
     </tr>`).join("");
   $("#graph").innerHTML = `<table><thead><tr><th>知识点</th><th>掌握度</th><th>考频</th><th>资料</th><th>前置</th></tr></thead><tbody>${rows}</tbody></table>`;
 
-  $("#rank").innerHTML = d.points.slice().sort((a, b) => b.mention - a.mention).slice(0, 10)
+  $("#rank").innerHTML = d.points.sort((a, b) => b.mention - a.mention).slice(0, 10)
     .map((p, i) => `${i + 1}. ${p.name} <span class="sub">· ${p.mention} 次</span>`).join("<br>");
 
   const f = await api("/api/files");
