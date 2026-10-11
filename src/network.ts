@@ -34,7 +34,12 @@ import {
   masteryOf,
 } from "./types.ts";
 import { canonicalize, loadAliases, type AliasTable } from "./normalize.ts";
-import { analyzeProblem, analyzeResource } from "./analyze/analyze.ts";
+import {
+  analyzeProblem,
+  analyzeProblemDetailed,
+  analyzeResourceDetailed,
+  type ExtractSource,
+} from "./analyze/analyze.ts";
 import {
   atomicWrite,
   keepRecent,
@@ -508,13 +513,30 @@ export class SimNet implements SimulationNetwork {
   }
 
   // ---------- §4.9 analyzeRes / analyzePro（委托 analyze.ts 流水线） ----------
-  async analyzeRes(resource: Resource): Promise<AnalyzeResReq> {
+  /**
+   * 分析一份资料。**带来源标注**（model / rule / preset）：调用方只看"有没有 points"
+   * 是分不清"模型抽的"还是"回落到 md 声明抽的"（§4.9 补注）。
+   */
+  async analyzeResDetailed(
+    resource: Resource,
+  ): Promise<{ req: AnalyzeResReq; by: ExtractSource; note?: string }> {
     // 🔴 传 inputDir（只读输入），**不是** dataDir（可写产物）：presets 在输入侧。
-    return analyzeResource(resource, { dataDir: this.inputDir });
+    const d = await analyzeResourceDetailed(resource, { dataDir: this.inputDir, preferModel: true });
+    return { req: d.req, by: d.by, note: d.note };
+  }
+
+  async analyzeRes(resource: Resource): Promise<AnalyzeResReq> {
+    return (await this.analyzeResDetailed(resource)).req;
   }
 
   async analyzePro(problem: Problem): Promise<AnalyzeProReq> {
     return analyzeProblem(problem);
+  }
+
+  /** 真题抽取 + **来源标注**（网页壳要如实区分 model / rule，见 analyze.ts 的说明）。 */
+  async analyzeProDetailed(problem: Problem): Promise<{ req: AnalyzeProReq; by: ExtractSource; note?: string }> {
+    const d = await analyzeProblemDetailed(problem, { preferModel: true });
+    return { req: d.req, by: d.by, note: d.note };
   }
 
   // ---------- §4.8 record（L3） ----------
