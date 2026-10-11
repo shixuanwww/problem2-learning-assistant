@@ -162,6 +162,43 @@ async function main() {
     process.exit(1);
   }
 
+  // ---------- 第 5 步·续：多轮（题面演示第 5 条要求"多轮学习与做题之后"） ----------
+  line("第 5 步·续：多轮学习与做题（答对回升 → 该点排到最后；同点二次做错 → 稳定薄弱）");
+  const posOf = (name: string): number =>
+    net.makePlan().findIndex((x) => net.keyOf(x.point.name) === net.keyOf(name)) + 1;
+  const doCountOf = (name: string): number =>
+    net.makePlan()
+      .find((x) => net.keyOf(x.point.name) === net.keyOf(name))
+      ?.actions.filter((a) => a.kind === "Do").length ?? 0;
+
+  console.log("  —— 第 2 轮：连续答对这一道题，直到跨过「已掌握」阈值（0.80）——");
+  const posBefore2 = posOf(pName);
+  const seq: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const b4 = net.state.get(pKey) ?? 0.5;
+    net.record({ kind: "Do", problem: prob, status: "correct" });
+    seq.push(`${b4.toFixed(2)}→${(net.state.get(pKey) ?? 0.5).toFixed(2)}`);
+  }
+  const posAfter2 = posOf(pName);
+  const actsAfter2 = net.makePlan().find((x) => net.keyOf(x.point.name) === pKey)?.actions.length ?? 0;
+  console.log(`  ✓ 同一道题连续答对 5 次（每次 correct +0.15）：掌握度 ${seq.join(" / ")}`);
+  console.log(
+    `    计划里的位置：第 ${posBefore2} 位 → 第 ${posAfter2} 位（共 ${net.makePlan().length} 项）；该点动作数 ${actsAfter2} 条` +
+      ` —— 已掌握的点在同层内被排到最后（题面 L3 完成标志③"降低已掌握内容优先级"）。`,
+  );
+
+  console.log("  —— 第 3 轮：同一道题**又做错**（同一知识点第二次错）——");
+  const mB3 = net.state.get(pKey) ?? 0.5;
+  const doB3 = doCountOf(pName);
+  net.record({ kind: "Do", problem: prob, status: "incorrect" });
+  const doA3 = doCountOf(pName);
+  console.log(
+    `  ✓ 掌握度 ${mB3.toFixed(2)} → ${(net.state.get(pKey) ?? 0.5).toFixed(2)}；` +
+      `该点"答错/糊涂过"记录数 ${net.reviewProblemNames({ name: pName }).length} 条 ⇒ **稳定薄弱**（不是偶然做错）`,
+  );
+  console.log(`    本点 Do 动作数 ${doB3} → ${doA3}（回炉题继续加量）`);
+  console.log(`  第 3 轮后的计划：\n${fmtPlan(net)}`);
+
   // ---------- 补充演示（§4.13）：模型提议被拒 → 回落规则版计划 ----------
   line("补充演示：模型提议被拒 → 回落规则版计划（§4.13 / §8 用例 10·18）");
   const badDraft = [

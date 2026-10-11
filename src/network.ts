@@ -365,13 +365,21 @@ export class SimNet implements SimulationNetwork {
     return result;
   }
 
-  /** 计划键（§4.2 🔑）：(已掌握?1:0, 掌握度, -考频, 规范化名码点序) 层内升序。 */
+  /**
+   * 计划键（§4.2 🔑）：(已掌握?1:0, 掌握度, -考频, 规范化名码点序) 层内升序。
+   *
+   * 【2026-10-11 审核后修】第一项此前写成 `已掌握 ? 1 : 0`，升序一算就变成
+   * **已掌握的点排在最前** —— 与 §4.2 / README 写的"已掌握排最后、把主线让给没掌握的点"
+   * **正好相反**（题面 L3 完成标志③的"降低已掌握内容优先级"因此失效）。
+   * 现在用 `已掌握 ? 1 : 0` 的相反数：**未掌握在前、已掌握在后**，两组内部都按掌握度升序
+   * （谁更薄弱谁更靠前）。
+   */
   private compareByPlanKey(a: number, b: number): number {
     const ka = this.lookupKey(this.graph[a].name);
     const kb = this.lookupKey(this.graph[b].name);
-    const ma = masteryOf(this.state, ka) >= MASTERY_THRESHOLD ? 1 : 0;
-    const mb = masteryOf(this.state, kb) >= MASTERY_THRESHOLD ? 1 : 0;
-    if (ma !== mb) return ma - mb;
+    const na = masteryOf(this.state, ka) >= MASTERY_THRESHOLD ? 0 : 1; // 1 = 还没掌握 ⇒ 排前面
+    const nb = masteryOf(this.state, kb) >= MASTERY_THRESHOLD ? 0 : 1;
+    if (na !== nb) return nb - na;
     const sa = masteryOf(this.state, ka);
     const sb = masteryOf(this.state, kb);
     if (sa !== sb) return sa - sb;

@@ -100,3 +100,47 @@ test("用例29：动作填充是确定性的（同一状态两次调用逐项一
   // 计划整体也应一致
   assert.equal(JSON.stringify(net.makePlan()), JSON.stringify(net.makePlan()));
 });
+
+test("用例30：同一层里「已掌握」的点必须排在「未掌握」的点之后", () => {
+  // 【2026-10-11 审核后修】修前比较器把已掌握写成 `已掌握 ? 1 : 0` 且按升序排，
+  // 结果是"已掌握的点排最前"，与 §4.2 / README / 题面 L3 完成标志③ 全反。
+  const net = new SimNet({ dataDir: makeTempDir(), skipLoad: true, aliases: {} });
+  wireActions(net);
+  // 同一层三个互不依赖的点：A、B 未掌握，C 已掌握
+  net.integrate({
+    kind: "ResReq",
+    data: { resource: "m.md", points: [{ name: "A" }, { name: "B" }, { name: "C" }], edges: [] },
+  });
+  net.state.set(net.keyOf("C"), MASTERY_THRESHOLD);
+
+  const order = net.makePlan().map((x) => x.point.name);
+  assert.deepEqual(order, ["A", "B", "C"], `未掌握在前、已掌握在后，实际 ${JSON.stringify(order)}`);
+
+  // 再让 B 也掌握 ⇒ B 应被排到 C 之后（同在"已掌握"组内按掌握度升序）
+  net.state.set(net.keyOf("B"), MASTERY_THRESHOLD);
+  assert.deepEqual(net.makePlan().map((x) => x.point.name), ["A", "B", "C"]);
+
+  // 已掌握的点即使考频最高也不插队（考频是第三优先级）
+  assert.ok(net.pointRank(3).length <= 3, "pointRank 不受计划排序键影响");
+});
+
+test("用例31：跨过掌握阈值后，该点动作数收敛为「一道巩固题」", () => {
+  const net = makeSharedResourceNet();
+  net.integrate({
+    kind: "ProReq",
+    data: { problem: { name: "P1", content: "", kind: "计算", points: [{ name: "B" }] }, points: [{ name: "B" }] },
+  });
+  const b = net.findPointByName("B")!;
+  const before = fillActions(net, b).length;
+  assert.ok(before >= 2, "未掌握时应是 读+讲解+做题");
+  assert.ok(fillActions(net, b).some((a) => a.kind === "Read"));
+
+  // 顺手把前置 A 标为已掌握：这样"没有 Read"只可能是因为"本点已掌握"，
+  // 而不是因为规则 4（前置不足）本就不补 Read —— 否则断言证明不了收敛。
+  net.state.set(net.keyOf("A"), MASTERY_THRESHOLD);
+  net.state.set(net.keyOf("B"), 0.95);
+  const after = fillActions(net, b);
+  assert.equal(after.filter((a) => a.kind === "Do").length, 1, "已掌握只留一道巩固题");
+  assert.ok(!after.some((a) => a.kind === "Read"), "已掌握不再安排读资料");
+  assert.ok(after.length < before, `动作数应收敛：${before} → ${after.length}`);
+});
