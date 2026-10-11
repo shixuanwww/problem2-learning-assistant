@@ -25,6 +25,7 @@ import {
   readText,
 } from "./analyze/parse.ts";
 import { DATA, RUNTIME, RUNTIME_FILES } from "./paths.ts";
+import { hashFile, ingestOnce, loadLedger, saveLedger } from "./ingest-ledger.ts";
 import {
   UNCLASSIFIED_KIND,
   stateToJSON,
@@ -163,22 +164,64 @@ async function ingestProblem(file: string): Promise<{ by: ExtractedBy; points: n
   return { by, points: points.length, note };
 }
 
-/** 把 data/ 下现有的资料 + 真题全部接进体系（首次启动时用；已存在则幂等）。 */
+/** 启动接入的记账文件（落在产物目录 ⇒ demo 的 resetRuntime() 会连它一起清掉）。 */
+const LEDGER_FILE = path.join(RUNTIME, "ingested.json");
+/** T2_REINGEST=1 ⇒ 忽略记账、本轮全量重新接入（现场想演示"重新解析"时用）。 */
+const FORCE_REINGEST = process.env.T2_REINGEST === "1";
+
+/**
+ * 把 data/ 下现有的资料 + 真题接进体系。
+ *
+ * 🔴 2026-10-11 修：原来**每次启动都全量重新接入**，而走模型时点名是漂移的
+ *    （同一份 m01 三次抽取得 11 / 10 / 9 个点）⇒ 每次重启都并进一批近义新点，
+ *    实测连开三次网页壳：知识点 21 → 27 → 40，单调膨胀永不收敛；图涨大后
+ *    "让模型提议"还会因上下文过长退化成 by="none"。
+ *    现在按**内容 sha256 记账**（src/ingest-ledger.ts）：只有没接过、或内容变过的
+ *    文件才重新接入 ⇒ 重复启动不重复调模型、也不再污染知识体系。
+ */
 async function bootstrap(): Promise<void> {
   if (!hasChatKey()) {
     console.log("  ⚠ 未配置 DEEPSEEK_API_KEY ⇒ 启动接入走规则路径（md 声明），不调模型");
   }
-  for (const m of collectMdFiles(`${DATA}/materials`).sort()) {
-    const r = await ingestMaterial(m);
-    // ⚠️ 只有真的走了模型才写 model：回落时必须把来源（preset / rule）与原因一起打出来，
-    //    否则"配了 Key 但 Key 无效"这种情况会被日志显示成"模型抽取成功"，属于误导性日志。
-    console.log(`  接入资料 ${m} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点 / ${r.edges} 条前置边`);
-    if (r.points === 0) console.warn(`  ⚠ ${m} 没能抽出任何知识点，请检查该 md 或上传格式`);
+  if (FORCE_REINGEST) console.log("  ⚠ T2_REINGEST=1 ⇒ 忽略已接入记账，本轮全量重新接入");
+
+  const mats = collectMdFiles(`${DATA}/materials`).sort();
+  const pros = collectMdFiles(`${DATA}/problems`).sort().filter((f) => f.endsWith(".prob.md"));
+
+  // ⚠️ 分两轮跑（先资料、后真题），保证真题的考点挂到已存在的资料点上。
+  const matPass = await ingestOnce(mats, {
+    ledgerFile: LEDGER_FILE,
+    force: FORCE_REINGEST,
+    ingest: async (m) => {
+      const r = await ingestMaterial(m);
+      // ⚠️ 只有真的走了模型才写 model：回落时必须把来源（preset / rule）与原因一起打出来，
+      //    否则"配了 Key 但 Key 无效"这种情况会被日志显示成"模型抽取成功"，属于误导性日志。
+      console.log(`  接入资料 ${m} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点 / ${r.edges} 条前置边`);
+      if (r.points === 0) console.warn(`  ⚠ ${m} 没能抽出任何知识点，请检查该 md 或上传格式`);
+    },
+  });
+  const proPass = await ingestOnce(pros, {
+    ledgerFile: LEDGER_FILE,
+    force: FORCE_REINGEST,
+    ingest: async (p) => {
+      const r = await ingestProblem(p);
+      console.log(`  接入真题 ${p} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点`);
+    },
+  });
+
+  const skipped = matPass.skipped.length + proPass.skipped.length;
+  if (skipped > 0) {
+    console.log(`  ↷ 跳过 ${skipped} 份「已接入且内容未变」的文件（按内容 hash 记账，不重复调模型、不重复长点）`);
   }
-  for (const p of collectMdFiles(`${DATA}/problems`).sort().filter((f) => f.endsWith(".prob.md"))) {
-    const r = await ingestProblem(p);
-    console.log(`  接入真题 ${p} ← ${r.by}${describeNote(r.by, r.note)}｜${r.points} 个知识点`);
-  }
+}
+
+/** 上传 / 手动分析成功后补记一笔，避免下次启动把同一份内容再抽一遍（会长出近义新点）。 */
+function markIngested(file: string): void {
+  const h = hashFile(file);
+  if (h === "") return;
+  const ledger = loadLedger(LEDGER_FILE);
+  ledger[file] = h;
+  saveLedger(LEDGER_FILE, ledger);
 }
 
 /** 把"为什么没走模型"的原因压成日志里能看的一小段（模型成功时为空）。 */
@@ -376,9 +419,11 @@ const server = http.createServer(async (req, res) => {
       }
       if (file.startsWith(`${dataRoot}/problems/`)) {
         const r = await ingestProblem(file);
+        markIngested(file);
         return sendJSON(res, 200, { ok: true, file, kind: "ProReq", extractedBy: r.by, points: r.points, note: r.note });
       }
       const r = await ingestMaterial(file);
+      markIngested(file);
       return sendJSON(res, 200, {
         ok: true, file, kind: "ResReq", extractedBy: r.by, points: r.points, edges: r.edges, note: r.note,
       });
@@ -402,9 +447,11 @@ const server = http.createServer(async (req, res) => {
       //    失败逐级回落（presets / md 声明），响应里的 extractedBy 说明到底是谁抽的。
       if (target === "problems") {
         const r = await ingestProblem(rel);
+        markIngested(rel);
         return sendJSON(res, 200, { ok: true, file: rel, kind: "ProReq", extractedBy: r.by, points: r.points, note: r.note });
       }
       const r = await ingestMaterial(rel);
+      markIngested(rel);
       return sendJSON(res, 200, {
         ok: true, file: rel, kind: "ResReq", extractedBy: r.by, points: r.points, edges: r.edges, note: r.note,
       });
