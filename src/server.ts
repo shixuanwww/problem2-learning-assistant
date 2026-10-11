@@ -14,8 +14,9 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import path from "node:path";
 import { SimNet } from "./network.ts";
 import { proposePlan, wireActions } from "./plan.ts";
-import { loadAliases } from "./normalize.ts";
 import { QaEngine } from "./qa.ts";
+import { loadPreset } from "./analyze/analyze.ts";
+import { hasChatKey } from "./analyze/llm.ts";
 import {
   collectMdFiles,
   materialToChunks,
@@ -29,6 +30,7 @@ import {
   stateToJSON,
   type AnalyzeResReq,
   type Edge,
+  type Point,
   type Problem,
   type ProStatus,
 } from "./types.ts";
@@ -40,7 +42,7 @@ const PUBLIC_DIR = "public";
 
 const net = new SimNet({
   dataDir: RUNTIME,
-  aliases: loadAliases(path.join(DATA, "aliases.json")),
+  inputDir: DATA, // aliases.json / presets 在输入侧，产物在 RUNTIME 侧
   skipLoad: false, // 有历史产物就载入（重启不丢状态）
 });
 wireActions(net);
@@ -74,18 +76,92 @@ function materialReq(file: string): AnalyzeResReq {
   };
 }
 
+/** 一次抽取的"来源"标注：模型 / 预置兜底 / md 声明。 */
+type ExtractedBy = "model" | "preset" | "rule";
+
+/**
+ * 从**已落盘**的 md 文件抽取分析结果（上传 / analyze / 启动接入共用）。
+ *
+ * 🔴 这里就是"模型抽取"接进网页流程的地方（2026-10-11 修）：
+ *   以前上传只走 `materialReq()`（纯规则解析 `## 知识点:`），
+ *   ⇒ 真实课件转出来的 md（没有声明）上传后**静默得到 0 个知识点**，
+ *     L2 的"接模型解析资料"在网页上完全演不出来。
+ *   现在：有 Chat Key ⇒ **先调模型**（analyzeRes → analyze.ts 路 A），失败再回落
+ *   预置（presets）→ 最后才是声明解析；没 Key 就跳过模型，直接 preset → rule。
+ *   结果里带 `extractedBy`，界面/日志能看见到底是谁抽的。
+ */
+async function extractMaterial(file: string): Promise<{ req: AnalyzeResReq; by: ExtractedBy; note?: string }> {
+  if (hasChatKey()) {
+    try {
+      const req = await net.analyzeRes(file);
+      if (req.points.length > 0) return { req, by: "model" };
+      // 模型没抽出点（罕见）：继续往下回落
+      return fallbackMaterial(file, "模型未抽出任何知识点");
+    } catch (e) {
+      return fallbackMaterial(file, String(e));
+    }
+  }
+  return fallbackMaterial(file, "未配置 DEEPSEEK_API_KEY");
+}
+
+function fallbackMaterial(file: string, why: string): { req: AnalyzeResReq; by: ExtractedBy; note: string } {
+  const preset = loadPreset(DATA, file);
+  if (preset) {
+    console.warn(`[server] ${file} 未走模型（${why.slice(0, 60)}）⇒ 用 presets 预置结果兜底`);
+    return { req: preset, by: "preset", note: why };
+  }
+  const rule = materialReq(file);
+  return { req: rule, by: "rule", note: `${why}${rule.points.length ? "" : "（该资料无 md 声明，抽出 0 点）"}` };
+}
+
+/** 真题同理：优先让模型判断"这题考哪些知识点"，失败才回落 md 里的 `## 涉及知识点:`。 */
+async function extractProblem(file: string): Promise<{ problem: Problem; points: Point[]; by: ExtractedBy; note?: string }> {
+  const problem = problemFromFile(file);
+  if (hasChatKey()) {
+    try {
+      const req = await net.analyzePro(problem);
+      if (req.points.length > 0) return { problem, points: req.points, by: "model" };
+      return { problem, points: problem.points, by: "rule", note: "模型未抽出任何知识点" };
+    } catch (e) {
+      return { problem, points: problem.points, by: "rule", note: String(e) };
+    }
+  }
+  return { problem, points: problem.points, by: "rule", note: "未配置 DEEPSEEK_API_KEY" };
+}
+
+/** 接入一份资料：抽取 → integrate。返回抽取来源，便于日志/响应展示。 */
+async function ingestMaterial(file: string): Promise<{ by: ExtractedBy; points: number; edges: number; note?: string }> {
+  const { req, by, note } = await extractMaterial(file);
+  net.integrate({ kind: "ResReq", data: req });
+  rebuildIndex();
+  return { by, points: req.points.length, edges: req.edges.length, note };
+}
+
+/** 接入一道真题：抽取 → integrate。 */
+async function ingestProblem(file: string): Promise<{ by: ExtractedBy; points: number; note?: string }> {
+  const { problem, points, by, note } = await extractProblem(file);
+  net.integrate({ kind: "ProReq", data: { problem, points } });
+  return { by, points: points.length, note };
+}
+
 /** 把 data/ 下现有的资料 + 真题全部接进体系（首次启动时用；已存在则幂等）。 */
-function bootstrap(): void {
+async function bootstrap(): Promise<void> {
+  if (!hasChatKey()) {
+    console.log("  ⚠ 未配置 DEEPSEEK_API_KEY ⇒ 启动接入走规则路径（md 声明），不调模型");
+  }
   for (const m of collectMdFiles(`${DATA}/materials`).sort()) {
-    net.integrate({ kind: "ResReq", data: materialReq(m) });
+    const r = await ingestMaterial(m);
+    const tail = r.note && r.by !== "model" ? `（${r.note.slice(0, 60)}）` : "";
+    console.log(`  接入资料 ${m} ← ${r.by}｜${r.points} 个知识点 / ${r.edges} 条前置边${tail}`);
+    if (r.points === 0) console.warn(`  ⚠ ${m} 没能抽出任何知识点，请检查该 md 或上传格式`);
   }
   for (const p of collectMdFiles(`${DATA}/problems`).sort().filter((f) => f.endsWith(".prob.md"))) {
-    const prob = problemFromFile(p);
-    net.integrate({ kind: "ProReq", data: { problem: prob, points: prob.points } });
+    const r = await ingestProblem(p);
+    console.log(`  接入真题 ${p} ← ${r.by}｜${r.points} 个知识点`);
   }
-  rebuildIndex();
 }
-bootstrap();
+// ⚠️ bootstrap 是 async（有 Key 时要逐份调模型）⇒ 不能在这里裸调；
+//    移到 server.listen 回调里跑，避免"路由已能响应但体系还没建好"的中间态被看到。
 
 // ---------------------------------------------------------------- HTTP 小工具
 
@@ -259,14 +335,13 @@ const server = http.createServer(async (req, res) => {
       const file = String(body.file ?? "").trim();
       if (!file) return sendJSON(res, 400, { error: "缺少 file" });
       if (file.startsWith(`${DATA}/problems/`)) {
-        const prob = problemFromFile(file);
-        net.integrate({ kind: "ProReq", data: { problem: prob, points: prob.points } });
-        return sendJSON(res, 200, { ok: true, kind: "ProReq", points: prob.points.length });
+        const r = await ingestProblem(file);
+        return sendJSON(res, 200, { ok: true, file, kind: "ProReq", extractedBy: r.by, points: r.points, note: r.note });
       }
-      const req2 = materialReq(file);
-      net.integrate({ kind: "ResReq", data: req2 });
-      rebuildIndex();
-      return sendJSON(res, 200, { ok: true, kind: "ResReq", points: req2.points.length, edges: req2.edges.length });
+      const r = await ingestMaterial(file);
+      return sendJSON(res, 200, {
+        ok: true, file, kind: "ResReq", extractedBy: r.by, points: r.points, edges: r.edges, note: r.note,
+      });
     }
 
     // ---- POST /api/upload（JSON 真上传：落盘 → 自动分析） ----
@@ -283,15 +358,16 @@ const server = http.createServer(async (req, res) => {
       writeFileSync(full, content, "utf8");
       const rel = `${DATA}/${target}/${fileName}`.replace(/\\/g, "/");
 
+      // 🔴 这里就是"上传 → 模型解析"的接线点：有 Key 时走 analyzeRes / analyzePro，
+      //    失败逐级回落（presets / md 声明），响应里的 extractedBy 说明到底是谁抽的。
       if (target === "problems") {
-        const prob = problemFromFile(rel);
-        net.integrate({ kind: "ProReq", data: { problem: prob, points: prob.points } });
-        return sendJSON(res, 200, { ok: true, file: rel, kind: "ProReq", points: prob.points.length });
+        const r = await ingestProblem(rel);
+        return sendJSON(res, 200, { ok: true, file: rel, kind: "ProReq", extractedBy: r.by, points: r.points, note: r.note });
       }
-      const req2 = materialReq(rel);
-      net.integrate({ kind: "ResReq", data: req2 });
-      rebuildIndex();
-      return sendJSON(res, 200, { ok: true, file: rel, kind: "ResReq", points: req2.points.length, edges: req2.edges.length });
+      const r = await ingestMaterial(rel);
+      return sendJSON(res, 200, {
+        ok: true, file: rel, kind: "ResReq", extractedBy: r.by, points: r.points, edges: r.edges, note: r.note,
+      });
     }
 
     // ---- POST /api/propose（§4.13 模型提议通道的可视化：故意喂非法草稿看拒绝+回落） ----
@@ -318,8 +394,15 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`AI 学习辅助系统 · 网页壳已启动`);
   console.log(`  地址    ：http://127.0.0.1:${PORT}`);
   console.log(`  输入目录：${DATA}/（只读）｜产物目录：${RUNTIME}/`);
-  console.log(`  知识点  ：${net.alivePoints().length} 个｜真题：${net.problems.length} 道｜检索片段：${qa?.available ?? 0} 条`);
   console.log(`  ChatKey ：${process.env.DEEPSEEK_API_KEY ? "有" : "无（问答降级为抽取式）"}`);
   console.log(`  EmbedKey：${process.env.ZHIPU_API_KEY ? "有" : "无（检索降级为关键词）"}`);
   console.log(`  运行产物文件：${RUNTIME_FILES.join(", ")}`);
+  // 逐份接入 data/ 下已有资料与真题（有 Key 时真调模型；失败逐级回落）
+  bootstrap()
+    .then(() => {
+      console.log(
+        `  已就绪：知识点 ${net.alivePoints().length} 个｜真题 ${net.problems.length} 道｜检索片段 ${qa?.available ?? 0} 条`,
+      );
+    })
+    .catch((e) => console.error(`bootstrap 失败：${e instanceof Error ? e.message : String(e)}`));
 });
